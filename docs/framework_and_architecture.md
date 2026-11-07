@@ -1,6 +1,6 @@
 # ESP32-S3-DevKitC-1-N16R8 + RS-485 Furnace Controller: Framework & Architecture Guide
 
-## 1. Hardware Platform Overview
+## 1. Hardware Platform & Target HVAC Equipment
 
 - **Controller**: AITRIP ESP32-S3-DevKitC-1-N16R8 (ESP32-S3-WROOM-1-N16R8)
   - **SoC**: Dual-core Xtensa LX7 @ 240 MHz
@@ -8,92 +8,66 @@
   - **USB Interfaces**:
     - Dedicated USB-to-UART Bridge (`CH343` / `CH9102`, `VID:PID=1A86:55D3`) on `/dev/cu.usbmodem5CE51967211` (`UART0`)
     - Native USB-OTG / USB Serial/JTAG port (`GPIO19` / `GPIO20`)
-  - **Peripherals**: 3x Hardware UARTs (`UART0`, `UART1`, `UART2`), TWAI, SPI, I2C, RMT (onboard WS2812 RGB LED on GPIO 48 / GPIO 38)
-- **Transceiver Base**: M5Stack Atomic RS485 Base (`MAX3485` / `SP485EEN` isolated/DC-DC RS-485 transceiver)
-- **Target System**: Heil Ion Communicating System (International Comfort Products / Carrier ABCD 4-wire RS-485 communicating HVAC bus)
+  - **Peripherals**:
+    - `UART1` (`GPIO 18` RX, `GPIO 17` TX, `GPIO 21` RTS/DE_RE) -> 3.3V RS-485 Transceiver (`MAX3485` / `SP3485`)
+    - `GPIO 4` (1-Wire Bus) -> Waterproof `DS18B20` Digital Temperature Probes (Wood Boiler Supply & Return Water Pipes)
+    - Onboard WS2812 RGB LED (`GPIO 48` / `GPIO 38`)
+- **Target Furnace**: **Heil `G96CTN0601714A1`** (QuietComfort 96 Series, International Comfort Products / Carrier Global)
+  - **Type**: 96% AFUE Communicating Two-Stage Gas Furnace (`39,000 BTU/hr` Low Fire, `60,000 BTU/hr` High Fire)
+  - **Blower**: Variable-Speed Constant-Torque / Constant-Airflow ECM Blower (`1/2 HP, 373W`, ~1,400 CFM nominal)
+  - **Model Plug**: `HK70EZ089` (`Pin 1-4: 39 kΩ`, `Pin 2-3: 91 kΩ`)
+- **Target Wall Control**: **Heil Ion System Control** (4-wire ABCD communicating bus master `0x2001`)
 
 ---
 
 ## 2. Development Framework Comparison
 
-For building a reliable RS-485 Man-in-the-Middle (MitM) bridge, packet analyzer, and HVAC controller on the ESP32-S3, three primary firmware ecosystems were evaluated:
+For building a deterministic RS-485 ABCD bus sniffer, packet analyzer, and Wood Boiler / Furnace Blower co-controller on the ESP32-S3, three primary firmware ecosystems were evaluated:
 
 | Feature / Criterion | **PlatformIO (C++ / Arduino or ESP-IDF)** | **MicroPython / CircuitPython** | **ESPHome (YAML + C++ Custom Components)** |
 | :--- | :--- | :--- | :--- |
-| **UART / RS-485 Timing Determinism** | **Excellent (< 10 µs)**. Direct hardware UART FIFO, RS-485 half-duplex direction control, and FreeRTOS ISR queues. | **Poor (1–15 ms jitter)**. Garbage collection pauses and bytecode interpretation can drop or corrupt back-to-back RS-485 frames. | **Moderate**. Polling loop runs every ~16 ms (`loop()`); requires custom C++ & FreeRTOS tasks to avoid frame bottlenecks. |
-| **Dual-Core FreeRTOS Utilization** | **Full Native Control**. Pin RS-485 bus transceiver tasks to Core 1 and Wi-Fi/Web/MQTT/Logging to Core 0 (`xTaskCreatePinnedToCore`). | **Limited**. GIL / single-core execution model prevents true deterministic parallel bus forwarding. | **Implicit**. Single-threaded main loop unless dropping down to raw C++ FreeRTOS tasks anyway. |
-| **Man-in-the-Middle (Dual UART) Routing** | **First-Class**. Native support for bridging `UART1` (Thermostat side) and `UART2` (Furnace/ODU side) with zero-copy inspection and CRC recalculation. | **Fragile**. High risk of buffer overruns or missed inter-frame gaps during active MitM rewriting. | **Complex**. Requires writing the entire MitM engine in C++ and wrapping it for YAML configuration. |
-| **Debugging & Packet Analysis** | **Rich**. High-speed native USB CDC logging (`Serial`), binary/pcap frame streaming, unit testing, and static analysis. | **Interactive REPL**. Great for quick pin toggles, poor for sustained line-rate binary protocol decoding. | **Log-centric**. Designed for high-level sensor state reporting rather than raw protocol reverse engineering. |
-| **OTA & Smart Home Integration** | **Flexible**. Supports AsyncWebServer, MQTT (Home Assistant Auto-Discovery), WebSockets, and ArduinoOTA / ESP-IDF OTA. | **Manual**. Requires custom asyncio network stacks and watchdog handling. | **Turnkey**. Native Home Assistant API and OTA, best suited *after* a protocol is 100% static and low-bandwidth. |
+| **UART / RS-485 Timing Determinism** | **Excellent (< 10 µs)**. Direct hardware UART FIFO, RS-485 half-duplex direction control, and collision-avoidance idle gap timers. | **Poor (1–15 ms jitter)**. Garbage collection pauses and bytecode interpretation can drop or corrupt back-to-back RS-485 frames. | **Moderate**. Polling loop runs every ~16 ms (`loop()`); requires custom C++ & FreeRTOS tasks to avoid frame bottlenecks. |
+| **8 MB Octal PSRAM Ring Buffers** | **Full Native Control**. Direct `ps_malloc()` allocation for storing hundreds of raw & decoded RS-485 frames without touching internal SRAM. | **Limited**. Managed heap makes deterministic binary packet ring buffers slower. | **Manual**. Requires custom C++ component allocation. |
+| **ABCD Bus Protocol Analysis & Co-Control** | **First-Class**. Native support for passive listening (`DE/RE = LOW`) and collision-free peer transmission (`>= 15 ms` idle gap + CRC-16/ARC). | **Fragile**. High risk of missed inter-frame gaps during active bus writes. | **Complex**. Requires writing the entire protocol engine in C++ and wrapping it for YAML configuration. |
+| **Web UI & CSV Packet Export** | **Rich**. Embedded responsive multi-tab dashboard, live JSON telemetry, CSV packet export, and interactive bench simulation. | **Manual**. Requires custom asyncio network stacks and watchdog handling. | **Log-centric**. Designed for high-level sensor state reporting rather than raw protocol reverse engineering. |
 
-### Recommendation: **PlatformIO with C++ (Arduino / ESP-IDF Hybrid)**
-PlatformIO with C++ gives deterministic microsecond-level UART framing, hardware interrupt efficiency, native FreeRTOS dual-core task isolation, and full control over both hardware UARTs required for a fail-safe RS-485 Man-in-the-Middle architecture.
+### Selected Framework: **PlatformIO with C++ (Arduino / ESP-IDF Hybrid)**
 
 ---
 
 ## 3. Heil Ion / ICP ABCD Bus Protocol & Electrical Overview
 
-The Heil Ion System Controller (and compatible ICP / Carrier Infinity / Bryant Evolution communicating equipment) communicates over a 4-wire bus labeled **A, B, C, D**:
+The Heil Ion System Controller and Heil `G96CTN0601714A1` furnace communicate over a 4-wire bus labeled **A, B, C, D**:
 
 | Terminal | Signal | Description |
 | :--- | :--- | :--- |
 | **A** | `DATA +` (`RS-485 A` / Non-inverting) | Differential RS-485 data line |
 | **B** | `DATA -` (`RS-485 B` / Inverting) | Differential RS-485 data line |
-| **C** | `24 VAC Common` | Reference ground / AC return |
-| **D** | `24 VAC Hot` | 24 VAC power supply from furnace transformer |
-
-> **Electrical Safety Note**: Only connect **A** and **B** (and an isolated signal ground reference if applicable) to the RS-485 transceiver data terminals. Never apply raw 24 VAC (`C`/`D`) to the DC inputs of an RS-485 transceiver unless using a properly rated 24 VAC-to-DC buck rectifier.
+| **C** | `24 VAC Hot` | 24 VAC power supply from furnace transformer (fused via `1A` inline fuse to 24VAC->5VDC buck converter) |
+| **D** | `24 VAC Common` | Reference ground / 24 VAC return |
 
 ### Protocol Characteristics
-- **Physical Layer**: Half-duplex differential RS-485
-- **Typical Baud Rate**: `38400 bps`, `8N1` (8 data bits, no parity, 1 stop bit)
-- **Frame Structure**:
-  1. **Destination Address** (2 bytes, e.g., Thermostat `0x2001`, Furnace/IFC `0x4001`, Outdoor Unit `0x5001`, Broadcast `0xF1F1`)
+- **Physical Layer**: Half-duplex differential RS-485 (`38400 bps`, `8N1`)
+- **Frame Structure (10+ bytes)**:
+  1. **Destination Address** (2 bytes: `0x2001` Thermostat, `0x4001` Furnace IFC, `0x9201` Co-Controller/SAM, `0xFFFF` Broadcast)
   2. **Source Address** (2 bytes)
-  3. **Payload Length** (1 byte)
-  4. **PID / Register / Table Identifiers** (3 bytes)
-  5. **Command / Opcode** (1 byte: `0x0B` Read, `0x0C` Write, `0x06` ACK/Response, `0x15` NAK)
-  6. **Data Payload** ($N$ bytes)
-  7. **CRC-16** (2 bytes, CRC-16/MODBUS or Carrier-specific polynomial depending on generation)
+  3. **Payload Length** (1 byte: length of payload + 3-byte table/reg header)
+  4. **PID / Node Sequence** (2 bytes, typically `0x00, 0x00`)
+  5. **Function / Opcode** (1 byte: `0x0B` READ, `0x0C` WRITE, `0x06` ACK/RESPONSE, `0x15` NAK)
+  6. **Table & Register ID** (3 bytes: e.g., `00:3B:01` Zone 1 Config/Setpoint/Fan, `00:3B:02` Zone 1 Room Temp, `00:04:02` Furnace Blower & Stage Status)
+  7. **Data Payload** ($N$ bytes)
+  8. **CRC-16** (2 bytes, little-endian `CRC-16/ARC` polynomial `0x8005` / reflected `0xA001`, init `0x0000`)
 
 ---
 
-## 4. Dual-Core Man-in-the-Middle (MitM) Architecture
+## 4. Parallel ABCD Bus Co-Controller Architecture
 
-To intercept, inspect, and selectively modify commands between the Heil Ion Wall Control (Thermostat) and the Furnace Integrated Furnace Control (IFC) without triggering communication fault codes, the firmware uses a **Dual-Core FreeRTOS Architecture**:
+Instead of severing the factory thermostat wires for an inline Man-in-the-Middle bridge, the ESP32-S3 connects **in parallel as a peer device on the 4-wire ABCD bus** (identical to an ICP/Carrier System Access Module `0x9201`):
 
-```
-+-----------------------------------------------------------------------------------+
-|                            M5Stack StampS3 (ESP32-S3)                             |
-|                                                                                   |
-|   CORE 1 (Real-Time RS-485 Engine)          CORE 0 (Network, Telemetry & UI)      |
-|  +--------------------------------+        +-----------------------------------+  |
-|  | UART1 Task (Thermostat Side)   |        | Wi-Fi / MQTT / Home Assistant     |  |
-|  |  - Frame Sync & Timeout Timer  |        | WebSocket Live Packet Sniffer     |  |
-|  |  - CRC-16 Verification         |        | REST API & Override Rules Engine  |  |
-|  +---------------+----------------+        | USB CDC High-Speed Frame Logger   |  |
-|                  |                         | WS2812 Status LED State Machine   |  |
-|                  v                         +-----------------+-----------------+  |
-|  +--------------------------------+                          ^                    |
-|  | Deterministic MitM Router      | === Lock-Free RingBuf ==>|                    |
-|  |  - Pass-through by default     | <== Atomic Rule Table ===+                    |
-|  |  - Payload Rewrite + Re-CRC    |                                               |
-|  +---------------+----------------+                                               |
-|                  |                                                                |
-|                  v                                                                |
-|  +--------------------------------+                                               |
-|  | UART2 Task (Furnace/Bus Side)  |                                               |
-|  |  - Half-Duplex TX/RX Framing   |                                               |
-|  +--------------------------------+                                               |
-+-----------------------------------------------------------------------------------+
-```
-
-### Phased Rollout Strategy
-1. **Phase 1 — Passive Bus Sniffer (Single RS-485 Interface)**:
-   - Connect in high-impedance parallel (`A`/`B`) to the live ABCD bus.
-   - Capture, validate CRC-16, decode registers (airflow CFM, blower RPM, stage/modulation %, duct static pressure, outdoor temp, setpoints), and stream frames over USB Serial / WebSockets.
-2. **Phase 2 — Active Responder / Spoofer Validation**:
-   - Bench-test frame transmission, inter-frame gap timing, and CRC generation.
-3. **Phase 3 — Inline Dual-Transceiver Man-in-the-Middle (MitM)**:
-   - Physically split the `A`/`B` data pair between the Thermostat (`UART1`) and the Furnace (`UART2`) with a hardware NC relay bypass for fail-safe operation on power loss.
-   - Forward all frames transparently while selectively overriding target registers on the fly.
+1. **Zero Wire Cutting / Inherently Fail-Safe**: The factory wiring between the Ion Thermostat (`0x2001`) and the Heil `G96CTN0601714A1` (`0x4001`) remains 100% intact.
+2. **Stage 1 — Passive Bus Sniffer (`DE/RE` Locked `LOW`)**:
+   - Captures, validates CRC-16, decodes registers (Room Temp, Heat Setpoint, Fan Mode, Furnace Stage, Airflow CFM), and stores the last 250 frames in the 8 MB Octal PSRAM ring buffer for live inspection and `.csv` export.
+3. **Stage 2 — Automated Wood Boiler Co-Controller**:
+   - Monitors the hydronic Wood Boiler water temperature entering the plenum heat exchanger coil via `DS18B20` probes on `GPIO 4`.
+   - When `Boiler Supply >= 140°F`, shifts the Ion gas backup setpoint down to the fallback threshold (`64°F`) so gas stays off, and cycles the Heil `G96CTN` ECM blower (`Low`/`Med`/`High`) whenever the sensed room temperature drops below the target comfort setpoint (`70.0°F`).
+   - When `Boiler Supply < 130°F` (fire out), automatically restores the Ion thermostat's normal gas heating setpoint (`70.0°F`) and sets Fan Mode back to `AUTO` for seamless 2-stage gas fallback.

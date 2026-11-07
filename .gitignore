@@ -1,3 +1,6 @@
+# Local secrets (Wi-Fi / MQTT credentials)
+include/secrets.h
+
 # PlatformIO build artifacts
 .pio/
 .pioenvs/
