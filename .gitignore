@@ -1,0 +1,15 @@
+# PlatformIO build artifacts
+.pio/
+.pioenvs/
+.piolibdeps/
+
+# Local IDE / machine-specific generated databases
+.vscode/
+compile_commands.json
+.cache/
+
+# macOS metadata & AppleDouble files on external volumes
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
