@@ -1,6 +1,7 @@
 #include "controller.h"
 #include "water_sensor.h"
 #include <Preferences.h>
+#include <math.h>
 
 static constexpr uint8_t RGB_PIN_PRIMARY   = 48;
 static constexpr uint8_t RGB_PIN_SECONDARY = 38;
@@ -14,8 +15,10 @@ static void writeOnboardRgb(uint8_t r, uint8_t g, uint8_t b) {
 
 void FurnaceController::begin() {
     loadFromNvs();
-    m_state          = ControllerState::MONITOR_ONLY;
-    m_stateEnteredMs = millis();
+    m_state              = ControllerState::MONITOR_ONLY;
+    m_boilerHotLatched   = (g_waterSensor.getStatus().supply_temp_f >= m_config.boiler_on_f);
+    m_woodOverrideActive = m_boilerHotLatched;
+    m_stateEnteredMs     = millis();
 
     // Sync RS-485 transceiver TX enable with configured operating mode
     g_abcdBus.setTxEnabled(m_config.op_mode != OperatingMode::PASSIVE_SNIFFER_ONLY);
@@ -67,11 +70,12 @@ void FurnaceController::updateConfig(const ControllerConfig& newCfg, bool save) 
 
 const char* FurnaceController::getStateName() const {
     switch (m_state) {
-        case ControllerState::MONITOR_ONLY:        return "PASSIVE BUS MONITOR";
-        case ControllerState::WOOD_ACTIVE_STANDBY: return "WOOD HOT - STANDBY (SATISFIED)";
-        case ControllerState::WOOD_BLOWER_HEATING: return "WOOD HYDRONIC BLOWER HEATING";
-        case ControllerState::GAS_FALLBACK_MODE:   return "GAS FURNACE FALLBACK (BOILER COLD)";
-        case ControllerState::MANUAL_OVERRIDE:     return "MANUAL ECM BLOWER OVERRIDE";
+        case ControllerState::MONITOR_ONLY:         return "PASSIVE BUS MONITOR";
+        case ControllerState::WOOD_ACTIVE_STANDBY:  return "WOOD HOT - STANDBY (SATISFIED)";
+        case ControllerState::WOOD_BLOWER_HEATING:  return "WOOD HYDRONIC BLOWER HEATING";
+        case ControllerState::BOILER_COLD_COASTING: return "BOILER COLD - COASTING (ROOM WARM)";
+        case ControllerState::GAS_FALLBACK_MODE:    return "GAS FURNACE ACTIVE (THERMOSTAT RESTORED)";
+        case ControllerState::MANUAL_OVERRIDE:      return "MANUAL ECM BLOWER OVERRIDE";
     }
     return "PASSIVE BUS MONITOR";
 }
@@ -85,18 +89,37 @@ const char* FurnaceController::getOpModeName() const {
     return "Auto Wood Boiler Co-Controller";
 }
 
+const char* FurnaceController::getIonSetpointStatusText() const {
+    switch (m_state) {
+        case ControllerState::WOOD_ACTIVE_STANDBY:
+        case ControllerState::WOOD_BLOWER_HEATING:
+            return "HELD AT BACKUP (Wood Boiler Active)";
+        case ControllerState::BOILER_COLD_COASTING:
+            return "HELD AT BACKUP (Boiler Cold, Room Warm)";
+        case ControllerState::GAS_FALLBACK_MODE:
+            return "RESTORED TO COMFORT (Gas Furnace Active)";
+        case ControllerState::MANUAL_OVERRIDE:
+            return "HELD AT BACKUP (Manual Blower Override)";
+        case ControllerState::MONITOR_ONLY:
+        default:
+            return "PASSIVE MONITOR (Thermostat Unmodified)";
+    }
+}
+
 RgbVisual FurnaceController::getStatusLedVisual() const {
     switch (m_state) {
         case ControllerState::MONITOR_ONLY:
-            return {  0,  40,  72, "CYAN (Passive Monitor)",       "#00a8ff" };
+            return {  0,  40,  72, "CYAN (Passive Monitor)",        "#00a8ff" };
         case ControllerState::WOOD_ACTIVE_STANDBY:
-            return {  0,  72,  20, "GREEN (Wood Hot / Standby)",   "#00e676" };
+            return {  0,  72,  20, "GREEN (Wood Hot / Standby)",    "#00e676" };
         case ControllerState::WOOD_BLOWER_HEATING:
-            return { 84,  38,   0, "AMBER (Wood Blower Heating)",  "#ffb300" };
+            return { 84,  38,   0, "AMBER (Wood Blower Heating)",   "#ffb300" };
+        case ControllerState::BOILER_COLD_COASTING:
+            return {  0,  56,  56, "TEAL (Boiler Cold / Coasting)", "#14b8a6" };
         case ControllerState::GAS_FALLBACK_MODE:
-            return {  0,  16,  84, "BLUE (Gas Fallback Active)",   "#3b82f6" };
+            return {  0,  16,  84, "BLUE (Gas Furnace Restored)",   "#3b82f6" };
         case ControllerState::MANUAL_OVERRIDE:
-            return { 56,   0,  84, "PURPLE (Manual Fan Override)", "#b388ff" };
+            return { 56,   0,  84, "PURPLE (Manual Fan Override)",  "#b388ff" };
     }
     return { 0, 40, 72, "CYAN", "#00a8ff" };
 }
@@ -129,23 +152,33 @@ void FurnaceController::transitionTo(ControllerState nextState, const char* reas
         case ControllerState::WOOD_ACTIVE_STANDBY:
             g_abcdBus.sendCoControllerCommand(AbcdFanMode::AUTO,
                                               m_config.gas_fallback_setpoint_f,
-                                              "Boiler Hot & Room Satisfied -> Fan AUTO, Gas Fallback SP");
+                                              "Boiler Hot & Room Satisfied -> Ion SP Lowered to Backup, Fan AUTO");
             break;
         case ControllerState::WOOD_BLOWER_HEATING:
             g_abcdBus.sendCoControllerCommand(m_config.target_fan_speed,
                                               m_config.gas_fallback_setpoint_f,
-                                              "Boiler Hot & Room Calling -> Hydronic ECM Blower ON");
+                                              "Boiler Hot & Room Calling -> Ion SP Lowered to Backup, ECM Blower ON");
+            break;
+        case ControllerState::BOILER_COLD_COASTING:
+            g_abcdBus.sendCoControllerCommand(AbcdFanMode::AUTO,
+                                              m_config.gas_fallback_setpoint_f,
+                                              "Boiler Cold but Room >= Comfort SP -> Fan AUTO, Coasting");
             break;
         case ControllerState::GAS_FALLBACK_MODE:
             g_abcdBus.sendCoControllerCommand(AbcdFanMode::AUTO,
                                               m_config.comfort_setpoint_f,
-                                              "Boiler Cold -> Restore Ion Gas Setpoint & Fan AUTO");
+                                              "Boiler Cold & Room < Comfort SP -> Restore Ion Thermostat to Comfort SP!");
             break;
         case ControllerState::MANUAL_OVERRIDE:
             g_abcdBus.sendCoControllerCommand(m_config.target_fan_speed,
                                               m_config.gas_fallback_setpoint_f,
                                               "Manual Blower Override Enabled");
             break;
+    }
+
+    // Refresh simulated furnace telemetry so stage/CFM reflect the new command immediately
+    if (g_abcdBus.isSimBusEnabled()) {
+        g_abcdBus.injectSimulatedCycle();
     }
 }
 
@@ -169,32 +202,66 @@ void FurnaceController::evaluateStateMachine() {
     // OperatingMode::AUTO_WOOD_CO_CONTROLLER
     const float supplyWaterF = g_waterSensor.getStatus().supply_temp_f;
     const float roomTempF    = g_abcdBus.getTelemetry().room_temp_f;
+    const float currentIonSp = g_abcdBus.getTelemetry().ion_heat_setpoint_f;
 
-    // Determine whether the Wood Boiler water is hot (with hysteresis between boiler_on_f and boiler_off_f)
-    const bool wasWoodActive = (m_state == ControllerState::WOOD_ACTIVE_STANDBY ||
-                                m_state == ControllerState::WOOD_BLOWER_HEATING);
-    const bool boilerHot = wasWoodActive ? (supplyWaterF >= m_config.boiler_off_f)
-                                         : (supplyWaterF >= m_config.boiler_on_f);
+    // 1. Update Wood Boiler Hot Latch with hysteresis (boiler_on_f vs boiler_off_f)
+    if (supplyWaterF >= m_config.boiler_on_f) {
+        m_boilerHotLatched   = true;
+        // ONLY when the Wood Boiler reaches the active threshold do we latch wood override active
+        m_woodOverrideActive = true;
+    } else if (supplyWaterF <= m_config.boiler_off_f) {
+        m_boilerHotLatched = false;
+    }
 
-    if (!boilerHot) {
-        transitionTo(ControllerState::GAS_FALLBACK_MODE, "Boiler Water Below Threshold");
+    // 2. CASE A: Wood Boiler Water is HOT (>= threshold)
+    //    -> Hold Ion Thermostat at Gas Backup Setpoint (e.g. 64F) and cycle ECM Blower to maintain Comfort Setpoint (70F)
+    if (m_boilerHotLatched) {
+        if (m_state == ControllerState::WOOD_BLOWER_HEATING) {
+            if (roomTempF >= (m_config.comfort_setpoint_f + 0.5f)) {
+                transitionTo(ControllerState::WOOD_ACTIVE_STANDBY, "Room Reached Comfort Setpoint + 0.5F");
+            } else if (g_abcdBus.getTelemetry().ion_fan_mode != m_config.target_fan_speed ||
+                       fabsf(currentIonSp - m_config.gas_fallback_setpoint_f) > 0.6f) {
+                g_abcdBus.sendCoControllerCommand(m_config.target_fan_speed,
+                                                  m_config.gas_fallback_setpoint_f,
+                                                  "Enforce Wood Mode Backup Setpoint & Blower Speed");
+            }
+        } else {
+            if (roomTempF < m_config.comfort_setpoint_f) {
+                transitionTo(ControllerState::WOOD_BLOWER_HEATING, "Boiler Hot & Room < Comfort Setpoint");
+            } else {
+                transitionTo(ControllerState::WOOD_ACTIVE_STANDBY, "Boiler Hot & Room >= Comfort Setpoint");
+                if (fabsf(currentIonSp - m_config.gas_fallback_setpoint_f) > 0.6f) {
+                    g_abcdBus.sendCoControllerCommand(AbcdFanMode::AUTO,
+                                                      m_config.gas_fallback_setpoint_f,
+                                                      "Enforce Wood Mode Backup Setpoint");
+                }
+            }
+        }
         return;
     }
 
-    // Boiler is hot! Check room temperature against comfort_setpoint_f (with +-0.4F deadband)
-    if (m_state == ControllerState::WOOD_BLOWER_HEATING) {
-        if (roomTempF >= (m_config.comfort_setpoint_f + 0.4f)) {
-            transitionTo(ControllerState::WOOD_ACTIVE_STANDBY, "Room Reached Comfort Setpoint");
-        } else if (g_abcdBus.getTelemetry().ion_fan_mode != m_config.target_fan_speed) {
-            g_abcdBus.sendCoControllerCommand(m_config.target_fan_speed,
-                                              m_config.gas_fallback_setpoint_f,
-                                              "Sync Target Blower Speed");
-        }
+    // 3. CASE B: Wood Boiler Water is COLD (<= boiler_off_f)
+    //    Rule: If the boiler is below the active threshold, the thermostat setpoint must NEVER be reduced!
+    //    - If we were just in Wood Mode (m_woodOverrideActive == true) and the room is still >= comfort_setpoint_f,
+    //      we coast with the blower off until the room drops below comfort_setpoint_f.
+    //    - Once roomTempF < comfort_setpoint_f (or if m_woodOverrideActive is already false), we unlatch
+    //      m_woodOverrideActive = false and keep the Ion Thermostat restored at comfort_setpoint_f (70F)
+    //      regardless of how warm the gas furnace heats the room!
+    if (m_woodOverrideActive && roomTempF >= m_config.comfort_setpoint_f) {
+        transitionTo(ControllerState::BOILER_COLD_COASTING,
+                     "Boiler Just Cooled, Coasting on Residual Wood Heat Until Room < Comfort SP");
     } else {
-        if (roomTempF <= (m_config.comfort_setpoint_f - 0.3f)) {
-            transitionTo(ControllerState::WOOD_BLOWER_HEATING, "Room Below Comfort Setpoint");
-        } else {
-            transitionTo(ControllerState::WOOD_ACTIVE_STANDBY, "Boiler Hot & Room Satisfied");
+        m_woodOverrideActive = false;
+        transitionTo(ControllerState::GAS_FALLBACK_MODE,
+                     "Boiler Cold -> Ion Thermostat Restored to Comfort Setpoint (Gas Mode)");
+        if (fabsf(currentIonSp - m_config.comfort_setpoint_f) > 0.6f ||
+            g_abcdBus.getTelemetry().ion_fan_mode != AbcdFanMode::AUTO) {
+            g_abcdBus.sendCoControllerCommand(AbcdFanMode::AUTO,
+                                              m_config.comfort_setpoint_f,
+                                              "Sync Restored Ion Comfort Setpoint");
+            if (g_abcdBus.isSimBusEnabled()) {
+                g_abcdBus.injectSimulatedCycle();
+            }
         }
     }
 }

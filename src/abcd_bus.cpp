@@ -125,6 +125,54 @@ void AbcdBusDriver::clearCaptureBuffer() {
     m_ringCount = 0;
 }
 
+void AbcdBusDriver::updateSimulatedFurnaceStage() {
+    if (m_telemetry.ion_fan_mode == AbcdFanMode::LOW_SPEED) {
+        m_telemetry.furnace_stage       = FurnaceStage::BLOWER_ONLY;
+        m_telemetry.furnace_airflow_cfm = 650;
+        m_telemetry.blower_rpm          = 620;
+        m_telemetry.supply_air_temp_f   = 104.0f;
+    } else if (m_telemetry.ion_fan_mode == AbcdFanMode::MED_SPEED) {
+        m_telemetry.furnace_stage       = FurnaceStage::BLOWER_ONLY;
+        m_telemetry.furnace_airflow_cfm = 1050;
+        m_telemetry.blower_rpm          = 890;
+        m_telemetry.supply_air_temp_f   = 108.0f;
+    } else if (m_telemetry.ion_fan_mode == AbcdFanMode::HIGH_SPEED) {
+        m_telemetry.furnace_stage       = FurnaceStage::BLOWER_ONLY;
+        m_telemetry.furnace_airflow_cfm = 1400;
+        m_telemetry.blower_rpm          = 1140;
+        m_telemetry.supply_air_temp_f   = 112.0f;
+    } else {
+        // Fan is AUTO: simulate normal Ion Thermostat gas heat call with +0.5F hysteresis
+        const bool wasGasFiring = (m_telemetry.furnace_stage == FurnaceStage::STAGE1_LOW_39K ||
+                                   m_telemetry.furnace_stage == FurnaceStage::STAGE2_HIGH_60K);
+        const bool shouldFireGas = wasGasFiring
+            ? (m_telemetry.room_temp_f < (m_telemetry.ion_heat_setpoint_f + 0.5f))
+            : (m_telemetry.room_temp_f < m_telemetry.ion_heat_setpoint_f);
+
+        if (shouldFireGas) {
+            m_telemetry.furnace_stage       = FurnaceStage::STAGE1_LOW_39K;
+            m_telemetry.furnace_airflow_cfm = 950;
+            m_telemetry.blower_rpm          = 820;
+            m_telemetry.supply_air_temp_f   = 122.0f;
+        } else {
+            m_telemetry.furnace_stage       = FurnaceStage::OFF;
+            m_telemetry.furnace_airflow_cfm = 0;
+            m_telemetry.blower_rpm          = 0;
+            m_telemetry.supply_air_temp_f   = 72.0f;
+        }
+    }
+}
+
+void AbcdBusDriver::setSimulatedRoomTempF(float tempF) {
+    m_telemetry.room_temp_f = tempF;
+    updateSimulatedFurnaceStage();
+}
+
+void AbcdBusDriver::setSimulatedIonSetpointF(float setpointF) {
+    m_telemetry.ion_heat_setpoint_f = setpointF;
+    updateSimulatedFurnaceStage();
+}
+
 uint32_t AbcdBusDriver::getBusIdleMs() const {
     const uint32_t now = millis();
     if (now >= m_stats.last_activity_ms) {
@@ -258,28 +306,10 @@ void AbcdBusDriver::decodeAndRecordFrame(const uint8_t* buf, size_t len, bool is
                     m_telemetry.ion_heat_setpoint_f = static_cast<float>(spByte);
                 }
                 m_telemetry.last_update_ms = rec.timestamp_ms;
-
-                // Update furnace blower CFM telemetry to match active fan speed
-                if (m_telemetry.ion_fan_mode == AbcdFanMode::LOW_SPEED) {
-                    m_telemetry.furnace_stage       = FurnaceStage::BLOWER_ONLY;
-                    m_telemetry.furnace_airflow_cfm = 650;
-                    m_telemetry.blower_rpm          = 620;
-                } else if (m_telemetry.ion_fan_mode == AbcdFanMode::MED_SPEED) {
-                    m_telemetry.furnace_stage       = FurnaceStage::BLOWER_ONLY;
-                    m_telemetry.furnace_airflow_cfm = 1050;
-                    m_telemetry.blower_rpm          = 890;
-                } else if (m_telemetry.ion_fan_mode == AbcdFanMode::HIGH_SPEED) {
-                    m_telemetry.furnace_stage       = FurnaceStage::BLOWER_ONLY;
-                    m_telemetry.furnace_airflow_cfm = 1400;
-                    m_telemetry.blower_rpm          = 1140;
-                } else if (m_telemetry.furnace_stage == FurnaceStage::BLOWER_ONLY) {
-                    m_telemetry.furnace_stage       = FurnaceStage::OFF;
-                    m_telemetry.furnace_airflow_cfm = 0;
-                    m_telemetry.blower_rpm          = 0;
-                }
+                updateSimulatedFurnaceStage();
 
                 snprintf(rec.summary, sizeof(rec.summary),
-                         "Zone1 Config %s: Fan=%s, HeatSP=%uF",
+                         "Zone1 Config %s: Fan=%s, IonHeatSP=%uF",
                          funcToName(rec.func),
                          fanModeToName(m_telemetry.ion_fan_mode),
                          (unsigned)spByte);
@@ -423,6 +453,7 @@ void AbcdBusDriver::injectSimulatedCycle() {
 
     // Frame 3: Heil G96CTN0601714A1 (0x4001) replies to Ion Thermostat (0x2001) with live stage, CFM, RPM
     {
+        updateSimulatedFurnaceStage();
         uint8_t f[19];
         f[0]  = 0x20; f[1]  = 0x01; // Dest: Ion Thermostat
         f[2]  = 0x40; f[3]  = 0x01; // Src : Heil G96CTN
@@ -435,7 +466,7 @@ void AbcdBusDriver::injectSimulatedCycle() {
         f[13] = static_cast<uint8_t>(m_telemetry.furnace_airflow_cfm & 0xFF);
         f[14] = static_cast<uint8_t>((m_telemetry.blower_rpm >> 8) & 0xFF);
         f[15] = static_cast<uint8_t>(m_telemetry.blower_rpm & 0xFF);
-        f[16] = static_cast<uint8_t>(m_telemetry.furnace_airflow_cfm > 0 ? 108 : 72);
+        f[16] = static_cast<uint8_t>(m_telemetry.supply_air_temp_f + 0.5f);
         const uint16_t crc = computeCrc16(f, 17);
         f[17] = static_cast<uint8_t>(crc & 0xFF);
         f[18] = static_cast<uint8_t>((crc >> 8) & 0xFF);

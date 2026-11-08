@@ -102,8 +102,9 @@ public:
 
     void clearCaptureBuffer();
 
-    // Update simulated room temp for desk testing
-    void setSimulatedRoomTempF(float tempF) { m_telemetry.room_temp_f = tempF; }
+    // Update simulated room temp and/or Ion thermostat setpoint for desk testing
+    void setSimulatedRoomTempF(float tempF);
+    void setSimulatedIonSetpointF(float setpointF);
 
     // Inject a realistic sequence of Ion Thermostat <-> Heil G96CTN0601714A1 frames
     void injectSimulatedCycle();
@@ -132,6 +133,7 @@ private:
     void decodeAndRecordFrame(const uint8_t* buf, size_t len, bool isTx, bool isSimulated);
     void appendRecordToRing(const AbcdFrameRecord& rec);
     bool transmitRawFrame(const uint8_t* frame, size_t len);
+    void updateSimulatedFurnaceStage();
 
     AbcdFrameRecord* m_ringBuffer       = nullptr;
     size_t           m_ringHead         = 0;

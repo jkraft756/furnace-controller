@@ -13,8 +13,9 @@ enum class ControllerState : uint8_t {
     MONITOR_ONLY         = 0,
     WOOD_ACTIVE_STANDBY  = 1,
     WOOD_BLOWER_HEATING  = 2,
-    GAS_FALLBACK_MODE    = 3,
-    MANUAL_OVERRIDE      = 4
+    BOILER_COLD_COASTING = 3,
+    GAS_FALLBACK_MODE    = 4,
+    MANUAL_OVERRIDE      = 5
 };
 
 struct ControllerConfig {
@@ -44,8 +45,10 @@ public:
     void updateConfig(const ControllerConfig& newCfg, bool saveToNvs = true);
 
     ControllerState getState() const { return m_state; }
+    bool            isBoilerHotLatched() const { return m_boilerHotLatched; }
     const char*     getStateName() const;
     const char*     getOpModeName() const;
+    const char*     getIonSetpointStatusText() const;
     RgbVisual       getStatusLedVisual() const;
 
     void applyStatusLed(bool pulseBright);
@@ -57,9 +60,11 @@ private:
     void transitionTo(ControllerState nextState, const char* reason);
 
     ControllerConfig m_config{};
-    ControllerState  m_state             = ControllerState::MONITOR_ONLY;
-    uint32_t         m_lastEvalMs        = 0;
-    uint32_t         m_stateEnteredMs    = 0;
+    ControllerState  m_state               = ControllerState::MONITOR_ONLY;
+    bool             m_boilerHotLatched    = false;
+    bool             m_woodOverrideActive  = false;
+    uint32_t         m_lastEvalMs          = 0;
+    uint32_t         m_stateEnteredMs      = 0;
 };
 
 extern FurnaceController g_controller;

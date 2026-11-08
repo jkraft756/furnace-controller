@@ -28,7 +28,7 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(<!DOCTYPE html>
     :root {
       --bg: #0b0f19;
       --card: #131b2e;
-      --card-alt: #182238;
+      --card-hi: #172542;
       --border: #23304d;
       --text: #e2e8f0;
       --muted: #94a3b8;
@@ -43,7 +43,7 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(<!DOCTYPE html>
       background: var(--bg);
       color: var(--text);
       padding: 20px 14px 48px;
-      max-width: 1180px;
+      max-width: 1200px;
       margin: 0 auto;
     }
     header {
@@ -113,12 +113,26 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(<!DOCTYPE html>
       border-radius: 12px;
       padding: 15px;
     }
+    .card.highlight {
+      background: var(--card-hi);
+      border-color: #2e4a7d;
+    }
     .label { color: var(--muted); font-size: 0.74rem; text-transform: uppercase; letter-spacing: 0.06em; }
-    .value { font-size: 1.3rem; font-weight: 700; margin-top: 6px; }
+    .value { font-size: 1.35rem; font-weight: 700; margin-top: 6px; }
     .subvalue { color: var(--muted); font-size: 0.78rem; margin-top: 5px; }
+    .pill {
+      display: inline-block;
+      margin-top: 6px;
+      padding: 3px 8px;
+      border-radius: 6px;
+      font-size: 0.73rem;
+      font-weight: 700;
+      background: #1e293b;
+      color: #38bdf8;
+    }
     .two-col {
       display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(340px, 1fr));
+      grid-template-columns: repeat(auto-fit, minmax(360px, 1fr));
       gap: 16px;
       margin-bottom: 16px;
     }
@@ -153,18 +167,18 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(<!DOCTYPE html>
       border: 1px solid #334155;
       border-radius: 6px;
       padding: 7px 10px;
-      width: 165px;
+      width: 175px;
       font-size: 0.86rem;
     }
-    input[type="range"] { width: 170px; accent-color: var(--accent); }
+    input[type="range"] { width: 175px; accent-color: var(--accent); }
     .btn-row { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
     button, .btn-link {
       background: #1e293b;
       color: var(--text);
       border: 1px solid #334155;
       border-radius: 8px;
-      padding: 8px 13px;
-      font-size: 0.83rem;
+      padding: 8px 12px;
+      font-size: 0.81rem;
       font-weight: 600;
       cursor: pointer;
       text-decoration: none;
@@ -248,7 +262,12 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(<!DOCTYPE html>
       <div class="card">
         <div class="label">Ion Sensed Room Temp</div>
         <div class="value" id="roomTemp">-- °F</div>
-        <div class="subvalue" id="comfortTarget">Target Comfort: -- °F</div>
+        <div class="subvalue" id="comfortTarget">Comfort Target: -- °F</div>
+      </div>
+      <div class="card highlight">
+        <div class="label">Ion Thermostat Setpoint (0x2001)</div>
+        <div class="value" id="ionSpBig" style="color:#38bdf8;">-- °F</div>
+        <div class="pill" id="ionSpStatus">--</div>
       </div>
       <div class="card">
         <div class="label">Heil G96CTN ECM Blower</div>
@@ -256,19 +275,14 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(<!DOCTYPE html>
         <div class="subvalue" id="cfmRpm">-- CFM &bull; -- RPM</div>
       </div>
       <div class="card">
-        <div class="label">Furnace Stage &amp; Gas SP</div>
-        <div class="value" id="furnaceStage">--</div>
-        <div class="subvalue" id="ionSp">Ion Gas Setpoint: -- °F</div>
+        <div class="label">Heil G96CTN Heating Stage</div>
+        <div class="value" id="furnaceStage" style="font-size:1.05rem;">--</div>
+        <div class="subvalue" id="supplyAirInfo">Supply Air: -- °F</div>
       </div>
       <div class="card">
-        <div class="label">ABCD RS-485 Transceiver</div>
-        <div class="value" id="busMode">--</div>
-        <div class="subvalue" id="busStats">RX: 0 &bull; TX: 0 &bull; CRC OK: 0</div>
-      </div>
-      <div class="card">
-        <div class="label">ESP32-S3 System Health</div>
-        <div class="value" id="wifiInfo">--</div>
-        <div class="subvalue" id="memInfo">PSRAM: -- MB &bull; Uptime: --s</div>
+        <div class="label">ESP32-S3 &amp; ABCD Bus Health</div>
+        <div class="value" id="wifiInfo" style="font-size:1.05rem;">--</div>
+        <div class="subvalue" id="busStats">RX: 0 &bull; TX: 0 &bull; PSRAM: -- MB</div>
       </div>
     </section>
 
@@ -335,6 +349,10 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(<!DOCTYPE html>
           <input type="range" min="60" max="76" step="0.5" id="simRoom" value="68.5" oninput="updateSimLabels()" onchange="pushSim()">
         </div>
         <div class="form-row">
+          <label>Ion Thermostat Setpoint: <strong><span id="lblSimIonSp">64</span> °F</strong></label>
+          <input type="range" min="55" max="80" step="1" id="simIonSp" value="64" oninput="updateSimLabels()" onchange="pushIonSp()">
+        </div>
+        <div class="form-row">
           <label for="simBusToggle">Periodic ABCD Bus Traffic Generator</label>
           <select id="simBusToggle" onchange="pushSim()">
             <option value="1">Enabled (Every 4s on Bench)</option>
@@ -342,10 +360,10 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(<!DOCTYPE html>
           </select>
         </div>
         <div class="btn-row">
-          <button onclick="quickScenario(160, 142, 68.0)">Test: Boiler Hot + Room Cold (Blower ON)</button>
-          <button onclick="quickScenario(160, 148, 71.0)">Test: Boiler Hot + Room Warm (Standby)</button>
-          <button onclick="quickScenario(115, 110, 68.0)">Test: Fire Out (Gas Fallback)</button>
-          <button onclick="rescanOneWire()">Rescan GPIO 4 (1-Wire)</button>
+          <button onclick="quickScenario(160, 142, 68.0)">1. Boiler Hot + Room Cold (Blower ON, Ion-&gt;64°F)</button>
+          <button onclick="quickScenario(160, 148, 71.0)">2. Boiler Hot + Room Warm (Standby, Ion-&gt;64°F)</button>
+          <button onclick="quickScenario(115, 110, 71.0)">3. Boiler Cold + Room Warm (Coasting, Ion 64°F)</button>
+          <button onclick="quickScenario(115, 110, 68.0)">4. Boiler Cold + Room Cold (Restore Ion-&gt;70°F, Gas ON)</button>
         </div>
       </div>
     </div>
@@ -414,6 +432,7 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(<!DOCTYPE html>
       document.getElementById('lblSimSupply').textContent = document.getElementById('simSupply').value;
       document.getElementById('lblSimReturn').textContent = document.getElementById('simReturn').value;
       document.getElementById('lblSimRoom').textContent = document.getElementById('simRoom').value;
+      document.getElementById('lblSimIonSp').textContent = document.getElementById('simIonSp').value;
     }
 
     async function refreshStatus() {
@@ -433,20 +452,29 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(<!DOCTYPE html>
         document.getElementById('comfortTarget').textContent =
           'Target Comfort: ' + d.cfg.comfort_sp.toFixed(1) + ' °F (Boiler On >= ' + d.cfg.boiler_on.toFixed(0) + ' °F)';
 
+        document.getElementById('ionSpBig').textContent = d.ion_heat_sp_f.toFixed(1) + ' °F';
+        const spPill = document.getElementById('ionSpStatus');
+        spPill.textContent = d.ion_sp_status;
+        if (d.ion_sp_status.includes('RESTORED')) {
+          spPill.style.background = '#1e3a8a';
+          spPill.style.color = '#93c5fd';
+        } else if (d.ion_sp_status.includes('BACKUP')) {
+          spPill.style.background = '#064e3b';
+          spPill.style.color = '#34d399';
+        } else {
+          spPill.style.background = '#1e293b';
+          spPill.style.color = '#cbd5e1';
+        }
+
         document.getElementById('fanMode').textContent = d.fan_mode;
-        document.getElementById('cfmRpm').textContent =
-          d.airflow_cfm + ' CFM • ' + d.blower_rpm + ' RPM • Supply Air ' + d.supply_air_f.toFixed(0) + ' °F';
+        document.getElementById('cfmRpm').textContent = d.airflow_cfm + ' CFM • ' + d.blower_rpm + ' RPM';
 
         document.getElementById('furnaceStage').textContent = d.furnace_stage;
-        document.getElementById('ionSp').textContent = 'Active Ion Gas Backup SP: ' + d.ion_heat_sp_f.toFixed(0) + ' °F';
-
-        document.getElementById('busMode').textContent = d.bus.tx_enabled ? 'ACTIVE CO-CTRL (GPIO21 AUTO)' : 'PASSIVE LISTEN (GPIO21 LOW)';
-        document.getElementById('busStats').textContent =
-          'RX: ' + d.bus.rx + ' • TX: ' + d.bus.tx + ' • CRC OK: ' + d.bus.crc_ok + ' • Idle: ' + d.bus.idle_ms + ' ms';
+        document.getElementById('supplyAirInfo').textContent = 'Plenum Supply Air: ' + d.supply_air_f.toFixed(0) + ' °F';
 
         document.getElementById('wifiInfo').textContent = d.ip + ' (' + d.rssi_dbm + ' dBm)';
-        document.getElementById('memInfo').textContent =
-          'PSRAM Free: ' + (d.free_psram / (1024*1024)).toFixed(2) + ' MB • Uptime: ' + d.uptime_s + 's';
+        document.getElementById('busStats').textContent =
+          'RX: ' + d.bus.rx + ' • TX: ' + d.bus.tx + ' • Free PSRAM: ' + (d.free_psram / (1024*1024)).toFixed(2) + ' MB';
 
         document.getElementById('pktCountBadge').textContent = d.bus.stored;
         document.getElementById('probeBadge').textContent =
@@ -454,6 +482,10 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(<!DOCTYPE html>
 
         g_capturePaused = d.bus.paused;
         document.getElementById('btnPause').textContent = g_capturePaused ? 'Resume Capture' : 'Pause Capture';
+
+        // Keep the Ion Thermostat Setpoint slider synced with the active thermostat setpoint
+        document.getElementById('simIonSp').value = Math.round(d.ion_heat_sp_f);
+        document.getElementById('lblSimIonSp').textContent = Math.round(d.ion_heat_sp_f);
 
         if (!g_cfgInitialized) {
           document.getElementById('cfgOpMode').value = d.cfg.op_mode;
@@ -503,17 +535,21 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(<!DOCTYPE html>
       if (g_activeTab === 'sniffer') refreshPackets();
     }
 
+    async function pushIonSp() {
+      const params = new URLSearchParams({
+        ion_sp_f: document.getElementById('simIonSp').value
+      });
+      await fetch('/api/sim?' + params.toString(), { method: 'POST' });
+      refreshStatus();
+      if (g_activeTab === 'sniffer') refreshPackets();
+    }
+
     async function quickScenario(sup, ret, room) {
       document.getElementById('simSupply').value = sup;
       document.getElementById('simReturn').value = ret;
       document.getElementById('simRoom').value = room;
       updateSimLabels();
       await pushSim();
-    }
-
-    async function rescanOneWire() {
-      await fetch('/api/sim?rescan_onewire=1', { method: 'POST' });
-      refreshStatus();
     }
 
     async function injectBusCycle() {
@@ -602,7 +638,7 @@ static void handleApiStatus() {
     const ControllerConfig&  cc = g_controller.getConfig();
     const RgbVisual          lv = g_controller.getStatusLedVisual();
 
-    char json[1152];
+    char json[1280];
     snprintf(json, sizeof(json),
              "{"
              "\"uptime_s\":%lu,"
@@ -614,6 +650,7 @@ static void handleApiStatus() {
              "\"core\":%d,"
              "\"ctrl_state\":\"%s\","
              "\"op_mode_name\":\"%s\","
+             "\"ion_sp_status\":\"%s\","
              "\"led_color\":\"%s\","
              "\"led_hex\":\"%s\","
              "\"probes\":%u,"
@@ -658,6 +695,7 @@ static void handleApiStatus() {
              xPortGetCoreID(),
              g_controller.getStateName(),
              g_controller.getOpModeName(),
+             g_controller.getIonSetpointStatusText(),
              lv.label,
              lv.hex,
              (unsigned)ws.detected_probes,
@@ -730,7 +768,9 @@ static void handleApiSim() {
     }
     if (s_server.hasArg("room_f")) {
         g_abcdBus.setSimulatedRoomTempF(s_server.arg("room_f").toFloat());
-        g_abcdBus.injectSimulatedCycle();
+    }
+    if (s_server.hasArg("ion_sp_f")) {
+        g_abcdBus.setSimulatedIonSetpointF(s_server.arg("ion_sp_f").toFloat());
     }
     if (s_server.hasArg("sim_bus")) {
         g_abcdBus.setSimBusEnabled(s_server.arg("sim_bus").toInt() != 0);
@@ -749,6 +789,9 @@ static void handleApiSim() {
     }
 
     g_controller.forceEvaluate();
+    if (s_server.hasArg("room_f") || s_server.hasArg("ion_sp_f")) {
+        g_abcdBus.injectSimulatedCycle();
+    }
     handleApiStatus();
 }
 
@@ -775,7 +818,7 @@ static void handleApiPackets() {
 
     AbcdFrameRecord rec{};
     char hexBuf[3 * ABCD_MAX_FRAME_BYTES + 4];
-    char rowBuf[384];
+    char rowBuf[512];
 
     for (size_t i = 0; i < countToSend; ++i) {
         if (!g_abcdBus.getFrameByOffsetFromNewest(i, rec)) {
@@ -816,7 +859,7 @@ static void handleApiPacketsCsv() {
 
     AbcdFrameRecord rec{};
     char hexBuf[3 * ABCD_MAX_FRAME_BYTES + 4];
-    char lineBuf[384];
+    char lineBuf[512];
 
     // Export oldest to newest
     for (size_t i = 0; i < totalStored; ++i) {
