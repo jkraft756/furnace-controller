@@ -2,10 +2,16 @@
 #include "abcd_bus.h"
 #include "water_sensor.h"
 #include "controller.h"
+#include "network_mgr.h"
 #include <WiFi.h>
 #include <WebServer.h>
+#include <Update.h>
+#include <Preferences.h>
 
 static WebServer s_server(80);
+static bool      s_otaSuccess = false;
+static String    s_otaError;
+
 WebPortal g_webPortal;
 
 static void formatHexBytes(const uint8_t* data, size_t len, char* out, size_t outSize) {
@@ -43,7 +49,7 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(<!DOCTYPE html>
       background: var(--bg);
       color: var(--text);
       padding: 20px 14px 48px;
-      max-width: 1200px;
+      max-width: 1220px;
       margin: 0 auto;
     }
     header {
@@ -79,6 +85,7 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(<!DOCTYPE html>
     }
     .tabs {
       display: flex;
+      flex-wrap: wrap;
       gap: 8px;
       margin-bottom: 18px;
       border-bottom: 1px solid var(--border);
@@ -151,6 +158,7 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(<!DOCTYPE html>
       display: flex;
       justify-content: space-between;
       align-items: center;
+      gap: 8px;
     }
     .form-row {
       display: flex;
@@ -158,17 +166,27 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(<!DOCTYPE html>
       align-items: center;
       gap: 12px;
       margin-bottom: 11px;
-      font-size: 0.87rem;
+      font-size: 0.86rem;
     }
     .form-row label { color: var(--text); flex: 1; }
-    input[type="number"], select {
+    input[type="number"], input[type="text"], input[type="password"], select {
       background: #0b1324;
       color: var(--text);
       border: 1px solid #334155;
       border-radius: 6px;
       padding: 7px 10px;
-      width: 175px;
-      font-size: 0.86rem;
+      width: 195px;
+      font-size: 0.85rem;
+    }
+    input[type="file"] {
+      background: #0b1324;
+      color: var(--text);
+      border: 1px solid #334155;
+      border-radius: 6px;
+      padding: 7px;
+      width: 100%;
+      font-size: 0.83rem;
+      margin-bottom: 10px;
     }
     input[type="range"] { width: 175px; accent-color: var(--accent); }
     .btn-row { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
@@ -189,6 +207,8 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(<!DOCTYPE html>
     button:hover, .btn-link:hover { border-color: var(--accent); background: #26354d; }
     button.primary { background: #0284c7; border-color: #38bdf8; color: #fff; }
     button.primary:hover { background: #0369a1; }
+    button.danger { background: #7f1d1d; border-color: #ef4444; color: #fecaca; }
+    button.danger:hover { background: #991b1b; }
     .table-wrap {
       overflow-x: auto;
       margin-top: 12px;
@@ -216,6 +236,7 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(<!DOCTYPE html>
       position: sticky;
       top: 0;
     }
+    tr.clickable-row:hover { background: #172542; cursor: pointer; }
     .tag {
       padding: 2px 6px;
       border-radius: 4px;
@@ -235,13 +256,40 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(<!DOCTYPE html>
       opacity: 0;
       transition: opacity 0.25s;
     }
+    .progress-bar-bg {
+      width: 100%;
+      height: 16px;
+      background: #090d16;
+      border: 1px solid var(--border);
+      border-radius: 999px;
+      overflow: hidden;
+      margin-top: 10px;
+      display: none;
+    }
+    .progress-bar-fill {
+      height: 100%;
+      width: 0%;
+      background: linear-gradient(90deg, #0284c7, #10b981);
+      transition: width 0.15s ease;
+    }
+    code.cmd-box {
+      display: block;
+      background: #090d16;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 8px 10px;
+      font-size: 0.76rem;
+      color: #93c5fd;
+      margin-top: 8px;
+      user-select: all;
+    }
   </style>
 </head>
 <body>
   <header>
     <div>
       <h1>Heil G96CTN0601714A1 &amp; Wood Boiler Controller</h1>
-      <div class="subtitle">Parallel ABCD Bus Co-Controller &amp; RS-485 Protocol Analyzer &bull; AITRIP ESP32-S3-N16R8</div>
+      <div class="subtitle">Parallel ABCD Bus Co-Controller, Protocol Analyzer &amp; Wireless Provisioning &bull; ESP32-S3-N16R8</div>
     </div>
     <div class="badge"><span class="dot" id="stateDot"></span><span id="stateBadge">LOADING...</span></div>
   </header>
@@ -249,6 +297,7 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(<!DOCTYPE html>
   <nav class="tabs">
     <button class="tab-btn active" onclick="switchTab('control')" id="tabbtn-control">1. Furnace &amp; Wood Boiler Control</button>
     <button class="tab-btn" onclick="switchTab('sniffer')" id="tabbtn-sniffer">2. RS-485 ABCD Bus Analyzer (<span id="pktCountBadge">0</span>)</button>
+    <button class="tab-btn" onclick="switchTab('network')" id="tabbtn-network">3. Wi-Fi, Network &amp; OTA</button>
   </nav>
 
   <!-- TAB 1: CONTROL & TELEMETRY -->
@@ -280,9 +329,9 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(<!DOCTYPE html>
         <div class="subvalue" id="supplyAirInfo">Supply Air: -- °F</div>
       </div>
       <div class="card">
-        <div class="label">ESP32-S3 &amp; ABCD Bus Health</div>
-        <div class="value" id="wifiInfo" style="font-size:1.05rem;">--</div>
-        <div class="subvalue" id="busStats">RX: 0 &bull; TX: 0 &bull; PSRAM: -- MB</div>
+        <div class="label">Network &amp; AP Status</div>
+        <div class="value" id="wifiInfo" style="font-size:1.02rem;">--</div>
+        <div class="subvalue" id="apSummary">--</div>
       </div>
     </section>
 
@@ -327,11 +376,12 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(<!DOCTYPE html>
         </div>
         <div class="btn-row">
           <button class="primary" onclick="saveConfig()">Save &amp; Apply Settings</button>
+          <button onclick="toggleSimPanel()" id="btnToggleSim">Hide Bench Simulator</button>
         </div>
       </div>
 
       <!-- Interactive Bench Simulation Panel -->
-      <div class="panel">
+      <div class="panel" id="simPanel">
         <h2>
           <span>Desk Prototyping &amp; Sensor Simulator</span>
           <span id="probeBadge" style="font-size:0.75rem;color:var(--muted);">Probes: 0</span>
@@ -413,19 +463,181 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(<!DOCTYPE html>
     </div>
   </div>
 
+  <!-- TAB 3: WI-FI, NETWORK & OTA -->
+  <div class="tab-pane" id="tab-network">
+    <div class="two-col">
+      <!-- Card 1: Nearby Wi-Fi Network Scanner -->
+      <div class="panel">
+        <h2>
+          <span>1. Live 2.4 GHz Wi-Fi Network Scanner</span>
+          <button class="primary" onclick="scanWifi()" id="btnScanWifi">Scan Nearby Networks</button>
+        </h2>
+        <p style="font-size:0.8rem;color:var(--muted);margin-bottom:8px;">
+          Click any discovered network row below to auto-fill the Station SSID field:
+        </p>
+        <div class="table-wrap" style="max-height:240px;">
+          <table>
+            <thead>
+              <tr>
+                <th>SSID</th>
+                <th>Signal</th>
+                <th>Ch</th>
+                <th>Security</th>
+              </tr>
+            </thead>
+            <tbody id="wifiScanBody">
+              <tr><td colspan="4" style="color:var(--muted);">Click "Scan Nearby Networks" to discover 2.4 GHz APs.</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- Card 2: Home Wi-Fi (Station) & IP Config -->
+      <div class="panel">
+        <h2>
+          <span>2. Home Wi-Fi (Station) &amp; IP Config (NVS)</span>
+          <span class="toast" id="netSaveToast">Saved!</span>
+        </h2>
+        <div class="form-row">
+          <label for="netStaSsid">Home Wi-Fi SSID (2.4 GHz)</label>
+          <input type="text" id="netStaSsid" placeholder="e.g. HomeNetwork">
+        </div>
+        <div class="form-row">
+          <label for="netStaPass">Wi-Fi Password</label>
+          <input type="password" id="netStaPass" placeholder="(Blank = keep current)">
+        </div>
+        <div class="form-row">
+          <label for="netMdns">mDNS Hostname (.local)</label>
+          <input type="text" id="netMdns" value="furnace-controller">
+        </div>
+        <div class="form-row">
+          <label for="netStaticMode">IPv4 Assignment Mode</label>
+          <select id="netStaticMode" onchange="toggleStaticFields()">
+            <option value="0">DHCP (Automatic IP from Router)</option>
+            <option value="1">Static IPv4 Configuration</option>
+          </select>
+        </div>
+        <div id="staticIpFields" style="display:none;">
+          <div class="form-row">
+            <label for="netStaticIp">Static IPv4 Address</label>
+            <input type="text" id="netStaticIp" value="192.168.111.240">
+          </div>
+          <div class="form-row">
+            <label for="netStaticGw">Gateway IPv4</label>
+            <input type="text" id="netStaticGw" value="192.168.111.1">
+          </div>
+          <div class="form-row">
+            <label for="netStaticMask">Subnet Mask</label>
+            <input type="text" id="netStaticMask" value="255.255.255.0">
+          </div>
+          <div class="form-row">
+            <label for="netStaticDns">DNS Server</label>
+            <input type="text" id="netStaticDns" value="1.1.1.1">
+          </div>
+        </div>
+        <div class="btn-row">
+          <button class="primary" onclick="saveNetConfig(true)">Save &amp; Reconnect Wi-Fi</button>
+          <button onclick="togglePassVisibility('netStaPass')">Show/Hide Password</button>
+        </div>
+      </div>
+
+      <!-- Card 3: Fallback Access Point (AP) & Captive Portal -->
+      <div class="panel">
+        <h2>
+          <span>3. Fallback Access Point (AP) &amp; Captive Portal</span>
+          <span class="pill" id="apStateBadge">STANDBY</span>
+        </h2>
+        <p style="font-size:0.8rem;color:var(--muted);margin-bottom:12px;">
+          If your home router is offline or rebooting after a power outage (&gt;15s), the ESP32-S3 automatically launches this Setup AP at <strong>http://192.168.4.1/</strong> and retries your home Wi-Fi every 60 seconds.
+        </p>
+        <div class="form-row">
+          <label for="netApSsid">Fallback AP SSID</label>
+          <input type="text" id="netApSsid" value="Furnace-Controller-Setup">
+        </div>
+        <div class="form-row">
+          <label for="netApPass">Fallback AP WPA2 Password</label>
+          <input type="password" id="netApPass" placeholder="(Blank = keep current)">
+        </div>
+        <div class="form-row">
+          <label for="netApAlways">AP Operating Policy</label>
+          <select id="netApAlways">
+            <option value="0">Auto-Fallback Only (When Home Wi-Fi Drops)</option>
+            <option value="1">Always-On (Broadcast Setup AP Continuously)</option>
+          </select>
+        </div>
+        <div class="btn-row">
+          <button class="primary" onclick="saveNetConfig(false)">Save AP Settings</button>
+          <button onclick="toggleApNow()" id="btnApToggle">Turn Setup AP On Now (10m)</button>
+        </div>
+      </div>
+
+      <!-- Card 4: Over-The-Air (OTA) Firmware Update & System Maintenance -->
+      <div class="panel">
+        <h2>
+          <span>4. Over-The-Air (OTA) Firmware Update &amp; System</span>
+          <span class="pill" id="sysPartBadge">app0</span>
+        </h2>
+        <p style="font-size:0.8rem;color:var(--muted);margin-bottom:8px;">
+          Select a compiled <code>firmware.bin</code> image (<code>.pio/build/esp32-s3-devkitc-1-n16r8/firmware.bin</code>) to flash wirelessly with dual-partition rollback protection:
+        </p>
+        <input type="file" id="otaFile" accept=".bin">
+        <div class="btn-row" style="margin-top:4px;">
+          <button class="primary" onclick="uploadOtaFirmware()" id="btnOtaUpload">Upload &amp; Flash Firmware (.bin)</button>
+        </div>
+        <div class="progress-bar-bg" id="otaProgressWrap">
+          <div class="progress-bar-fill" id="otaProgressFill"></div>
+        </div>
+        <div id="otaStatusMsg" style="font-size:0.8rem;color:var(--accent);margin-top:8px;"></div>
+
+        <div style="margin-top:14px;padding-top:12px;border-top:1px solid var(--border);font-size:0.8rem;color:var(--muted);">
+          <div><strong>Direct PlatformIO CLI Wireless Upload Command:</strong></div>
+          <code class="cmd-box" id="cliOtaCmd">pio run -t upload --upload-port 192.168.111.240</code>
+          <div style="margin-top:10px;" id="sysDiagLine">Reset Reason: -- &bull; MAC: --</div>
+        </div>
+
+        <div class="btn-row" style="margin-top:12px;">
+          <button onclick="rebootDevice()">Reboot Controller</button>
+          <button class="danger" onclick="resetDefaults()">Reset NVS Defaults</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
   <script>
     let g_activeTab = 'control';
     let g_cfgInitialized = false;
     let g_simInitialized = false;
+    let g_netInitialized = false;
     let g_capturePaused = false;
+    let g_simVisible = true;
+    let g_apActive = false;
 
     function switchTab(tab) {
       g_activeTab = tab;
       document.getElementById('tab-control').classList.toggle('active', tab === 'control');
       document.getElementById('tab-sniffer').classList.toggle('active', tab === 'sniffer');
+      document.getElementById('tab-network').classList.toggle('active', tab === 'network');
       document.getElementById('tabbtn-control').classList.toggle('active', tab === 'control');
       document.getElementById('tabbtn-sniffer').classList.toggle('active', tab === 'sniffer');
+      document.getElementById('tabbtn-network').classList.toggle('active', tab === 'network');
       if (tab === 'sniffer') refreshPackets();
+      if (tab === 'network' && !g_netInitialized) loadNetConfig();
+    }
+
+    function toggleSimPanel() {
+      g_simVisible = !g_simVisible;
+      document.getElementById('simPanel').style.display = g_simVisible ? 'block' : 'none';
+      document.getElementById('btnToggleSim').textContent = g_simVisible ? 'Hide Bench Simulator' : 'Show Bench Simulator';
+    }
+
+    function toggleStaticFields() {
+      const en = document.getElementById('netStaticMode').value === '1';
+      document.getElementById('staticIpFields').style.display = en ? 'block' : 'none';
+    }
+
+    function togglePassVisibility(id) {
+      const el = document.getElementById(id);
+      el.type = (el.type === 'password') ? 'text' : 'password';
     }
 
     function updateSimLabels() {
@@ -473,8 +685,9 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(<!DOCTYPE html>
         document.getElementById('supplyAirInfo').textContent = 'Plenum Supply Air: ' + d.supply_air_f.toFixed(0) + ' °F';
 
         document.getElementById('wifiInfo').textContent = d.ip + ' (' + d.rssi_dbm + ' dBm)';
-        document.getElementById('busStats').textContent =
-          'RX: ' + d.bus.rx + ' • TX: ' + d.bus.tx + ' • Free PSRAM: ' + (d.free_psram / (1024*1024)).toFixed(2) + ' MB';
+        document.getElementById('apSummary').textContent =
+          (d.net.ap_active ? ('Setup AP: ON (' + d.net.ap_ip + ')') : 'Setup AP: Auto-Standby') +
+          ' • Up: ' + d.uptime_s + 's';
 
         document.getElementById('pktCountBadge').textContent = d.bus.stored;
         document.getElementById('probeBadge').textContent =
@@ -482,6 +695,22 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(<!DOCTYPE html>
 
         g_capturePaused = d.bus.paused;
         document.getElementById('btnPause').textContent = g_capturePaused ? 'Resume Capture' : 'Pause Capture';
+
+        g_apActive = d.net.ap_active;
+        const apBadge = document.getElementById('apStateBadge');
+        if (apBadge) {
+          apBadge.textContent = d.net.ap_active ? ('ACTIVE (' + d.net.ap_ip + ')') : 'STANDBY (Auto-Fallback)';
+          apBadge.style.background = d.net.ap_active ? '#064e3b' : '#1e293b';
+          apBadge.style.color = d.net.ap_active ? '#34d399' : '#94a3b8';
+        }
+        const btnAp = document.getElementById('btnApToggle');
+        if (btnAp) {
+          btnAp.textContent = d.net.ap_active ? 'Turn Setup AP Off' : 'Turn Setup AP On Now (10m)';
+        }
+        document.getElementById('sysPartBadge').textContent = 'Partition: ' + d.net.part;
+        document.getElementById('cliOtaCmd').textContent = 'pio run -t upload --upload-port ' + d.ip;
+        document.getElementById('sysDiagLine').textContent =
+          'Reset: ' + d.net.reset_reason + ' • MAC: ' + d.net.mac + ' • Free PSRAM: ' + (d.free_psram / (1024*1024)).toFixed(2) + ' MB';
 
         // Keep the Ion Thermostat Setpoint slider synced with the active thermostat setpoint
         document.getElementById('simIonSp').value = Math.round(d.ion_heat_sp_f);
@@ -505,6 +734,151 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(<!DOCTYPE html>
           g_simInitialized = true;
         }
       } catch (e) {}
+    }
+
+    async function loadNetConfig() {
+      try {
+        const res = await fetch('/api/net/config');
+        const c = await res.json();
+        document.getElementById('netStaSsid').value = c.sta_ssid || '';
+        document.getElementById('netMdns').value = c.mdns_host || 'furnace-controller';
+        document.getElementById('netStaticMode').value = c.use_static_ip ? '1' : '0';
+        document.getElementById('netStaticIp').value = c.static_ip || '192.168.111.240';
+        document.getElementById('netStaticGw').value = c.static_gw || '192.168.111.1';
+        document.getElementById('netStaticMask').value = c.static_mask || '255.255.255.0';
+        document.getElementById('netStaticDns').value = c.static_dns || '1.1.1.1';
+        document.getElementById('netApSsid').value = c.ap_ssid || 'Furnace-Controller-Setup';
+        document.getElementById('netApAlways').value = c.ap_always_on ? '1' : '0';
+        toggleStaticFields();
+        g_netInitialized = true;
+      } catch (e) {}
+    }
+
+    async function scanWifi() {
+      const btn = document.getElementById('btnScanWifi');
+      const tbody = document.getElementById('wifiScanBody');
+      btn.textContent = 'Scanning (2s)...';
+      btn.disabled = true;
+      tbody.innerHTML = '<tr><td colspan="4" style="color:var(--accent);">Scanning 2.4 GHz channels...</td></tr>';
+      try {
+        const res = await fetch('/api/wifi/scan');
+        const data = await res.json();
+        if (!data.networks || data.networks.length === 0) {
+          tbody.innerHTML = '<tr><td colspan="4" style="color:var(--muted);">No 2.4 GHz networks found.</td></tr>';
+        } else {
+          tbody.innerHTML = data.networks.map(n => {
+            const safeSsid = n.ssid.replace(/'/g, "\\'");
+            return '<tr class="clickable-row" onclick="selectScannedSsid(\'' + safeSsid + '\')">' +
+              '<td><strong>' + n.ssid + '</strong></td>' +
+              '<td>' + n.rssi + ' dBm</td>' +
+              '<td>' + n.channel + '</td>' +
+              '<td>' + (n.secure ? 'WPA2/WPA3' : 'Open') + '</td>' +
+              '</tr>';
+          }).join('');
+        }
+      } catch (e) {
+        tbody.innerHTML = '<tr><td colspan="4" style="color:var(--red);">Scan failed.</td></tr>';
+      }
+      btn.textContent = 'Scan Nearby Networks';
+      btn.disabled = false;
+    }
+
+    function selectScannedSsid(ssid) {
+      document.getElementById('netStaSsid').value = ssid;
+      document.getElementById('netStaPass').focus();
+    }
+
+    async function saveNetConfig(reconnectNow) {
+      const params = new URLSearchParams({
+        sta_ssid: document.getElementById('netStaSsid').value,
+        sta_pass: document.getElementById('netStaPass').value,
+        mdns_host: document.getElementById('netMdns').value,
+        use_static_ip: document.getElementById('netStaticMode').value,
+        static_ip: document.getElementById('netStaticIp').value,
+        static_gw: document.getElementById('netStaticGw').value,
+        static_mask: document.getElementById('netStaticMask').value,
+        static_dns: document.getElementById('netStaticDns').value,
+        ap_ssid: document.getElementById('netApSsid').value,
+        ap_pass: document.getElementById('netApPass').value,
+        ap_always_on: document.getElementById('netApAlways').value,
+        reconnect: reconnectNow ? '1' : '0'
+      });
+      await fetch('/api/net/config?' + params.toString(), { method: 'POST' });
+      document.getElementById('netStaPass').value = '';
+      document.getElementById('netApPass').value = '';
+      const t = document.getElementById('netSaveToast');
+      t.style.opacity = 1;
+      setTimeout(() => { t.style.opacity = 0; }, 2500);
+      refreshStatus();
+    }
+
+    async function toggleApNow() {
+      await fetch('/api/net/ap_toggle?enable=' + (g_apActive ? '0' : '1'), { method: 'POST' });
+      setTimeout(refreshStatus, 400);
+    }
+
+    function uploadOtaFirmware() {
+      const fileInput = document.getElementById('otaFile');
+      const statusMsg = document.getElementById('otaStatusMsg');
+      const wrap = document.getElementById('otaProgressWrap');
+      const fill = document.getElementById('otaProgressFill');
+      const btn = document.getElementById('btnOtaUpload');
+
+      if (!fileInput.files || fileInput.files.length === 0) {
+        statusMsg.style.color = '#f87171';
+        statusMsg.textContent = 'Please select a compiled firmware.bin file first.';
+        return;
+      }
+
+      const file = fileInput.files[0];
+      const formData = new FormData();
+      formData.append('firmware', file, file.name);
+
+      wrap.style.display = 'block';
+      fill.style.width = '0%';
+      btn.disabled = true;
+      statusMsg.style.color = '#38bdf8';
+      statusMsg.textContent = 'Uploading ' + file.name + ' (' + (file.size / 1024).toFixed(0) + ' KB)...';
+
+      const xhr = new XMLHttpRequest();
+      xhr.open('POST', '/api/ota/upload', true);
+      xhr.upload.onprogress = function(e) {
+        if (e.lengthComputable) {
+          const pct = Math.round((e.loaded / e.total) * 100);
+          fill.style.width = pct + '%';
+          statusMsg.textContent = 'Uploading & writing to OTA partition: ' + pct + '%';
+        }
+      };
+      xhr.onload = function() {
+        btn.disabled = false;
+        if (xhr.status === 200) {
+          fill.style.width = '100%';
+          statusMsg.style.color = '#34d399';
+          statusMsg.textContent = 'OTA Flash Verified! Rebooting ESP32-S3 — reloading in 6 seconds...';
+          setTimeout(() => { window.location.reload(); }, 6000);
+        } else {
+          statusMsg.style.color = '#f87171';
+          statusMsg.textContent = 'OTA Error: ' + xhr.responseText;
+        }
+      };
+      xhr.onerror = function() {
+        btn.disabled = false;
+        statusMsg.style.color = '#f87171';
+        statusMsg.textContent = 'Network connection lost during OTA upload.';
+      };
+      xhr.send(formData);
+    }
+
+    async function rebootDevice() {
+      if (!confirm('Reboot the ESP32-S3 Furnace Controller now?')) return;
+      await fetch('/api/sys/reboot', { method: 'POST' });
+      setTimeout(() => { window.location.reload(); }, 5000);
+    }
+
+    async function resetDefaults() {
+      if (!confirm('Reset controller & network NVS settings back to defaults and reboot?')) return;
+      await fetch('/api/sys/reset_defaults', { method: 'POST' });
+      setTimeout(() => { window.location.reload(); }, 5000);
     }
 
     async function saveConfig() {
@@ -631,20 +1005,26 @@ static void handleRoot() {
     s_server.send_P(200, "text/html", INDEX_HTML);
 }
 
-static void handleApiStatus() {
-    const WaterSensorStatus& ws = g_waterSensor.getStatus();
-    const AbcdTelemetry&     bt = g_abcdBus.getTelemetry();
-    const AbcdBusStats&      bs = g_abcdBus.getStats();
-    const ControllerConfig&  cc = g_controller.getConfig();
-    const RgbVisual          lv = g_controller.getStatusLedVisual();
+static void handleCaptivePortalRedirect() {
+    s_server.sendHeader("Location", "http://192.168.4.1/", true);
+    s_server.send(302, "text/plain", "Redirecting to Furnace Controller Setup Portal...");
+}
 
-    char json[1280];
+static void handleApiStatus() {
+    const WaterSensorStatus&   ws = g_waterSensor.getStatus();
+    const AbcdTelemetry&       bt = g_abcdBus.getTelemetry();
+    const AbcdBusStats&        bs = g_abcdBus.getStats();
+    const ControllerConfig&    cc = g_controller.getConfig();
+    const RgbVisual            lv = g_controller.getStatusLedVisual();
+    const NetworkRuntimeStatus ns = g_netMgr.getStatus();
+
+    char json[1536];
     snprintf(json, sizeof(json),
              "{"
              "\"uptime_s\":%lu,"
              "\"ssid\":\"%s\","
              "\"ip\":\"%s\","
-             "\"rssi_dbm\":%d,"
+             "\"rssi_dbm\":%ld,"
              "\"free_heap\":%lu,"
              "\"free_psram\":%lu,"
              "\"core\":%d,"
@@ -684,12 +1064,21 @@ static void handleApiStatus() {
                "\"sim_bus\":%s,"
                "\"paused\":%s,"
                "\"psram\":%s"
+             "},"
+             "\"net\":{"
+               "\"sta_connected\":%s,"
+               "\"ap_active\":%s,"
+               "\"ap_ip\":\"%s\","
+               "\"ap_clients\":%u,"
+               "\"mac\":\"%s\","
+               "\"part\":\"%s\","
+               "\"reset_reason\":\"%s\""
              "}"
              "}",
              millis() / 1000UL,
-             WiFi.isConnected() ? WiFi.SSID().c_str() : "DISCONNECTED",
-             WiFi.isConnected() ? WiFi.localIP().toString().c_str() : "0.0.0.0",
-             WiFi.isConnected() ? (int)WiFi.RSSI() : 0,
+             ns.sta_connected ? WiFi.SSID().c_str() : "DISCONNECTED",
+             ns.sta_connected ? ns.sta_ip : ns.ap_ip,
+             (long)ns.sta_rssi_dbm,
              (unsigned long)ESP.getFreeHeap(),
              (unsigned long)ESP.getFreePsram(),
              xPortGetCoreID(),
@@ -725,7 +1114,14 @@ static void handleApiStatus() {
              bs.tx_enabled ? "true" : "false",
              bs.sim_bus_enabled ? "true" : "false",
              bs.capture_paused ? "true" : "false",
-             bs.psram_buffer_active ? "true" : "false");
+             bs.psram_buffer_active ? "true" : "false",
+             ns.sta_connected ? "true" : "false",
+             ns.ap_active ? "true" : "false",
+             ns.ap_ip,
+             (unsigned)ns.ap_clients,
+             ns.mac_addr,
+             FurnaceNetworkManager::getRunningPartitionLabel(),
+             FurnaceNetworkManager::getResetReasonString());
 
     s_server.send(200, "application/json", json);
 }
@@ -795,6 +1191,144 @@ static void handleApiSim() {
     handleApiStatus();
 }
 
+static void handleApiWifiScan() {
+    String json = g_netMgr.scanNetworksJson();
+    s_server.send(200, "application/json", json);
+}
+
+static void handleApiNetConfig() {
+    if (s_server.method() == HTTP_POST) {
+        NetworkConfig cfg = g_netMgr.getConfig();
+
+        if (s_server.hasArg("sta_ssid") && s_server.arg("sta_ssid").length() > 0) {
+            strncpy(cfg.sta_ssid, s_server.arg("sta_ssid").c_str(), sizeof(cfg.sta_ssid) - 1);
+            cfg.sta_ssid[sizeof(cfg.sta_ssid) - 1] = '\0';
+        }
+        if (s_server.hasArg("sta_pass") && s_server.arg("sta_pass").length() > 0) {
+            strncpy(cfg.sta_pass, s_server.arg("sta_pass").c_str(), sizeof(cfg.sta_pass) - 1);
+            cfg.sta_pass[sizeof(cfg.sta_pass) - 1] = '\0';
+        }
+        if (s_server.hasArg("mdns_host") && s_server.arg("mdns_host").length() > 0) {
+            strncpy(cfg.mdns_host, s_server.arg("mdns_host").c_str(), sizeof(cfg.mdns_host) - 1);
+            cfg.mdns_host[sizeof(cfg.mdns_host) - 1] = '\0';
+        }
+        if (s_server.hasArg("use_static_ip")) {
+            cfg.use_static_ip = (s_server.arg("use_static_ip").toInt() != 0);
+        }
+        if (s_server.hasArg("static_ip") && s_server.arg("static_ip").length() > 0) {
+            strncpy(cfg.static_ip, s_server.arg("static_ip").c_str(), sizeof(cfg.static_ip) - 1);
+        }
+        if (s_server.hasArg("static_gw") && s_server.arg("static_gw").length() > 0) {
+            strncpy(cfg.static_gw, s_server.arg("static_gw").c_str(), sizeof(cfg.static_gw) - 1);
+        }
+        if (s_server.hasArg("static_mask") && s_server.arg("static_mask").length() > 0) {
+            strncpy(cfg.static_mask, s_server.arg("static_mask").c_str(), sizeof(cfg.static_mask) - 1);
+        }
+        if (s_server.hasArg("static_dns") && s_server.arg("static_dns").length() > 0) {
+            strncpy(cfg.static_dns, s_server.arg("static_dns").c_str(), sizeof(cfg.static_dns) - 1);
+        }
+        if (s_server.hasArg("ap_ssid") && s_server.arg("ap_ssid").length() > 0) {
+            strncpy(cfg.ap_ssid, s_server.arg("ap_ssid").c_str(), sizeof(cfg.ap_ssid) - 1);
+        }
+        if (s_server.hasArg("ap_pass") && s_server.arg("ap_pass").length() >= 8) {
+            strncpy(cfg.ap_pass, s_server.arg("ap_pass").c_str(), sizeof(cfg.ap_pass) - 1);
+        }
+        if (s_server.hasArg("ap_always_on")) {
+            cfg.ap_always_on = (s_server.arg("ap_always_on").toInt() != 0);
+        }
+
+        const bool reconnectNow = !s_server.hasArg("reconnect") || (s_server.arg("reconnect").toInt() != 0);
+        g_netMgr.updateConfig(cfg, true, reconnectNow);
+    }
+
+    const NetworkConfig& c = g_netMgr.getConfig();
+    char json[512];
+    snprintf(json, sizeof(json),
+             "{"
+             "\"sta_ssid\":\"%s\","
+             "\"mdns_host\":\"%s\","
+             "\"use_static_ip\":%s,"
+             "\"static_ip\":\"%s\","
+             "\"static_gw\":\"%s\","
+             "\"static_mask\":\"%s\","
+             "\"static_dns\":\"%s\","
+             "\"ap_ssid\":\"%s\","
+             "\"ap_always_on\":%s"
+             "}",
+             c.sta_ssid,
+             c.mdns_host,
+             c.use_static_ip ? "true" : "false",
+             c.static_ip,
+             c.static_gw,
+             c.static_mask,
+             c.static_dns,
+             c.ap_ssid,
+             c.ap_always_on ? "true" : "false");
+    s_server.send(200, "application/json", json);
+}
+
+static void handleApiApToggle() {
+    const bool en = !s_server.hasArg("enable") || (s_server.arg("enable").toInt() != 0);
+    g_netMgr.setManualApOverride(en, 600000UL);
+    handleApiStatus();
+}
+
+static void handleApiOtaDone() {
+    if (s_otaSuccess) {
+        s_server.send(200, "application/json", "{\"ok\":true,\"msg\":\"OTA update verified. Rebooting...\"}");
+        g_netMgr.scheduleReboot(900);
+    } else {
+        s_server.send(500, "text/plain", s_otaError.length() > 0 ? s_otaError : "OTA Update Failed");
+    }
+}
+
+static void handleApiOtaUploadChunk() {
+    HTTPUpload& upload = s_server.upload();
+
+    if (upload.status == UPLOAD_FILE_START) {
+        s_otaSuccess = false;
+        s_otaError   = "";
+        Serial.printf("\n[WEB OTA] Receiving firmware image: %s\n", upload.filename.c_str());
+        if (!Update.begin(UPDATE_SIZE_UNKNOWN, U_FLASH)) {
+            s_otaError = Update.errorString();
+            Serial.printf("[WEB OTA] Begin failed: %s\n", s_otaError.c_str());
+        }
+    } else if (upload.status == UPLOAD_FILE_WRITE) {
+        if (s_otaError.length() == 0) {
+            if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
+                s_otaError = Update.errorString();
+                Serial.printf("[WEB OTA] Write failed: %s\n", s_otaError.c_str());
+            }
+        }
+    } else if (upload.status == UPLOAD_FILE_END) {
+        if (s_otaError.length() == 0) {
+            if (Update.end(true)) {
+                s_otaSuccess = true;
+                Serial.printf("[WEB OTA] Success! Wrote %u bytes. Scheduling reboot...\n", (unsigned)upload.totalSize);
+            } else {
+                s_otaError = Update.errorString();
+                Serial.printf("[WEB OTA] End verification failed: %s\n", s_otaError.c_str());
+            }
+        }
+    }
+}
+
+static void handleApiSysReboot() {
+    s_server.send(200, "application/json", "{\"ok\":true,\"msg\":\"Rebooting...\"}");
+    g_netMgr.scheduleReboot(600);
+}
+
+static void handleApiSysResetDefaults() {
+    Preferences p;
+    p.begin("furnace", false);
+    p.clear();
+    p.end();
+
+    g_netMgr.resetToDefaults();
+    s_server.send(200, "application/json", "{\"ok\":true,\"msg\":\"NVS defaults restored. Rebooting...\"}");
+    g_netMgr.scheduleReboot(700);
+}
+
 static void handleApiPackets() {
     size_t limit = 50;
     if (s_server.hasArg("limit")) {
@@ -861,7 +1395,6 @@ static void handleApiPacketsCsv() {
     char hexBuf[3 * ABCD_MAX_FRAME_BYTES + 4];
     char lineBuf[512];
 
-    // Export oldest to newest
     for (size_t i = 0; i < totalStored; ++i) {
         const size_t offsetFromNewest = totalStored - 1 - i;
         if (!g_abcdBus.getFrameByOffsetFromNewest(offsetFromNewest, rec)) {
@@ -896,6 +1429,21 @@ void WebPortal::begin() {
     s_server.on("/api/sim", HTTP_ANY, handleApiSim);
     s_server.on("/api/packets", HTTP_GET, handleApiPackets);
     s_server.on("/api/packets.csv", HTTP_GET, handleApiPacketsCsv);
+
+    // Wireless Provisioning, AP & OTA Endpoints
+    s_server.on("/api/wifi/scan", HTTP_GET, handleApiWifiScan);
+    s_server.on("/api/net/config", HTTP_ANY, handleApiNetConfig);
+    s_server.on("/api/net/ap_toggle", HTTP_ANY, handleApiApToggle);
+    s_server.on("/api/ota/upload", HTTP_POST, handleApiOtaDone, handleApiOtaUploadChunk);
+    s_server.on("/api/sys/reboot", HTTP_ANY, handleApiSysReboot);
+    s_server.on("/api/sys/reset_defaults", HTTP_ANY, handleApiSysResetDefaults);
+
+    // Captive Portal OS detection routes (Android, iOS/macOS, Windows)
+    s_server.on("/generate_204", HTTP_GET, handleCaptivePortalRedirect);
+    s_server.on("/hotspot-detect.html", HTTP_GET, handleCaptivePortalRedirect);
+    s_server.on("/ncsi.txt", HTTP_GET, handleCaptivePortalRedirect);
+    s_server.onNotFound(handleRoot);
+
     s_server.begin();
 }
 

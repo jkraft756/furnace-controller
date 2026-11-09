@@ -159,3 +159,36 @@ While you order the hardware from the BOM, we can build and flash **Phase 1 of t
    - **Upgraded Web Dashboard (`http://furnace-controller.local/`)**:
      - **Control & Telemetry Tab**: Live Wood Boiler Water Temp, Room Temp, Furnace Blower State, Operating Mode selector (`Passive Sniffer`, `Auto Wood Boiler Control`, `Manual Override`), and threshold settings.
      - **RS-485 Bus Sniffer Tab**: Live scrolling hex + decoded packet analyzer, filterable by address/function (`READ`, `WRITE`, `ACK`), a **"Download Capture (.csv/.log)"** button, and a **"Simulate Bus Traffic"** button so you can watch realistic Ion Thermostat ↔ Heil `G96CTN` packets flow through the decoder right now!
+
+
+---
+
+## 7. Zero-USB Wireless Provisioning, Fallback AP & OTA Management
+
+Once the **ESP32-S3 Furnace Controller** is mounted inside the enclosure on the side of the Heil `G96CTN0601714A1` furnace, you never need to plug a USB cable into it again—even if you change your home Wi-Fi router/SSID/password, your home router is temporarily rebooting after a power outage, or we push firmware updates after decoding Stage 1 furnace captures.
+
+### 7.1 Wi-Fi Connection & Fallback AP State Machine (`src/network_mgr.h/.cpp`)
+
+```mermaid
+stateDiagram-v2
+    [*] --> BOOT_LOAD_NVS: Boot
+    BOOT_LOAD_NVS --> STA_CONNECTING: Load SSID/Pass from NVS\n(Fallback to secrets.h if NVS empty)
+    STA_CONNECTING --> STA_CONNECTED: Connected within 15s\n(Start mDNS + OTA + HTTP Server)
+    STA_CONNECTING --> AP_FALLBACK_ACTIVE: Timeout (>15s) or No Credentials\nStart AP "Furnace-Controller-Setup"\nIP: 192.168.4.1 + Captive Portal DNS
+    STA_CONNECTED --> AP_FALLBACK_ACTIVE: Wi-Fi Link Lost for >15s
+    AP_FALLBACK_ACTIVE --> STA_RETRY_IN_AP_STA: Every 60s background retry
+    STA_RETRY_IN_AP_STA --> STA_CONNECTED: Home Router Back Online!\n(Gracefully shut down AP after 30s)
+    STA_RETRY_IN_AP_STA --> AP_FALLBACK_ACTIVE: Still Unreachable\n(Keep AP Online)
+```
+
+1. **NVS-First Credential Priority (with `secrets.h` Bootstrap)**:
+   - On first boot, if no Wi-Fi credentials have been saved in NVS Flash (`Preferences` namespace `"netcfg"`), the board automatically seeds NVS from compile-time `include/secrets.h` (`WIFI_SSID` / `WIFI_PASSWORD`).
+   - Updating the Wi-Fi SSID/Password in the Web UI saves directly to NVS Flash and overrides `secrets.h`.
+2. **Power-Outage Recovery (`Auto-Fallback + 60s Background Retry`)**:
+   - If home Wi-Fi isn't reachable within `15 seconds`, the ESP32-S3 automatically spins up `WIFI_AP_STA` mode with its own access point (`Furnace-Controller-Setup`, default password `furnace1234`, IP `http://192.168.4.1/`) and a Captive Portal `DNSServer` on port `53`.
+   - Every `60 seconds` while in AP Fallback mode, it checks if the home Wi-Fi network is back online and automatically reconnects, shutting down the temporary AP 30 seconds after LAN stability is restored (unless `ap_always_on` is enabled).
+3. **Physical "Emergency AP" Button (`BOOT` Button on `GPIO 0`)**:
+   - Holding the physical **`BOOT` button (`GPIO 0`)** for **3 seconds** toggles Manual AP Mode on for 10 minutes even while connected to LAN.
+4. **Two-Way Over-The-Air (OTA) Firmware Updates**:
+   - **Browser File Upload (`POST /api/ota/upload` via `<Update.h>`)**: Upload `firmware.bin` directly from Tab 3 of the Web Console with a live `0% -> 100%` progress bar and dual-partition (`app0`/`app1`) rollback safety.
+   - **Direct CLI / IDE Push (`ArduinoOTA` on Port `3232`)**: Supports `pio run -t upload --upload-port 192.168.111.240`.

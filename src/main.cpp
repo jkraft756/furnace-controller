@@ -1,6 +1,5 @@
 #include <Arduino.h>
 #include <WiFi.h>
-#include <ESPmDNS.h>
 #include <esp_chip_info.h>
 #include <esp_flash.h>
 #include <esp_psram.h>
@@ -9,20 +8,12 @@
 #include "abcd_bus.h"
 #include "water_sensor.h"
 #include "controller.h"
+#include "network_mgr.h"
 #include "web_portal.h"
-
-#if __has_include("secrets.h")
-#include "secrets.h"
-#else
-#define WIFI_SSID     "YOUR_WIFI_SSID"
-#define WIFI_PASSWORD "YOUR_WIFI_PASSWORD"
-#define MDNS_HOSTNAME "furnace-controller"
-#endif
 
 static uint32_t g_tick            = 0;
 static uint32_t g_lastHeartbeatMs = 0;
 static bool     g_pulseHigh       = false;
-static bool     g_mdnsStarted     = false;
 static String   g_cliLine;
 
 static void printHardwareBanner() {
@@ -53,42 +44,6 @@ static void printHardwareBanner() {
     Serial.println("==============================================================================");
 }
 
-static void setupWiFi() {
-    WiFi.mode(WIFI_STA);
-    WiFi.setHostname(MDNS_HOSTNAME);
-
-    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-    Serial.println("------------------------------------------------------------------------------");
-    Serial.printf("  Wi-Fi Station    : Connecting to SSID \"%s\" (MAC: %s)\n",
-                  WIFI_SSID, WiFi.macAddress().c_str());
-
-    const uint32_t startAttemptMs = millis();
-    while (WiFi.status() != WL_CONNECTED && (millis() - startAttemptMs) < 12000UL) {
-        g_controller.applyStatusLed(true);
-        delay(200);
-        g_controller.applyStatusLed(false);
-        delay(200);
-        Serial.print(".");
-    }
-    Serial.println();
-
-    if (WiFi.isConnected()) {
-        Serial.printf("  Wi-Fi Connected  : YES (RSSI: %d dBm, Channel: %d)\n",
-                      (int)WiFi.RSSI(), (int)WiFi.channel());
-        Serial.printf("  Web Dashboard    : http://%s/\n", WiFi.localIP().toString().c_str());
-        if (MDNS.begin(MDNS_HOSTNAME)) {
-            MDNS.addService("http", "tcp", 80);
-            g_mdnsStarted = true;
-            Serial.printf("  mDNS Hostname    : http://%s.local/\n", MDNS_HOSTNAME);
-        }
-    } else {
-        Serial.println("  Wi-Fi Connected  : NO (Will continue retrying in background)");
-    }
-    Serial.println("  Serial CLI Ready : Type 'help' for interactive bench commands");
-    Serial.println("------------------------------------------------------------------------------");
-    Serial.println();
-}
-
 static void handleSerialCliLine(String cmd) {
     cmd.trim();
     if (cmd.length() == 0) {
@@ -98,10 +53,14 @@ static void handleSerialCliLine(String cmd) {
     if (cmd.equalsIgnoreCase("help")) {
         Serial.println("\n--- Furnace Controller Serial CLI ---");
         Serial.println("  status              : Print full boiler, room, furnace & bus summary");
+        Serial.println("  wifi                : Print current Wi-Fi STA, Fallback AP & OTA network status");
+        Serial.println("  scan                : Scan nearby 2.4 GHz Wi-Fi networks and print JSON results");
+        Serial.println("  ap on / ap off      : Manually enable or disable the Setup Access Point (192.168.4.1)");
         Serial.println("  sim boiler <tempF>  : Set simulated Wood Boiler supply water temp (e.g. 'sim boiler 160')");
         Serial.println("  sim room <tempF>    : Set simulated Ion Room temp (e.g. 'sim room 68.0')");
         Serial.println("  mode <0|1|2>        : Set mode (0=Passive Sniffer, 1=Auto Wood Co-Ctrl, 2=Manual Fan)");
         Serial.println("  packets             : Print the 10 most recent ABCD RS-485 bus frames");
+        Serial.println("  reboot              : Schedule a clean ESP32-S3 soft reboot");
         Serial.println("-------------------------------------\n");
     } else if (cmd.equalsIgnoreCase("status")) {
         const WaterSensorStatus& ws = g_waterSensor.getStatus();
@@ -113,7 +72,7 @@ static void handleSerialCliLine(String cmd) {
         Serial.printf("  Boiler Water     : Supply %.1f F | Return %.1f F (dT %.1f F) [%s]\n",
                       ws.supply_temp_f, ws.return_temp_f, ws.delta_t_f,
                       ws.using_simulation ? "SIM" : "DS18B20");
-        Serial.printf("  Room / Setpoints : Room %.1f F | Target Comfort %.1f F | Ion Backup SP %.1f F\n",
+        Serial.printf("  Room / Setpoints : Room %.1f F | Target Comfort %.1f F | Ion Setpoint %.1f F\n",
                       bt.room_temp_f, cc.comfort_setpoint_f, bt.ion_heat_setpoint_f);
         Serial.printf("  Heil G96CTN      : Stage=%s | Fan=%s | %u CFM (%u RPM)\n",
                       AbcdBusDriver::stageToName(bt.furnace_stage),
@@ -123,6 +82,34 @@ static void handleSerialCliLine(String cmd) {
                       (unsigned long)bs.total_rx_frames, (unsigned long)bs.total_tx_frames,
                       (unsigned long)bs.crc_ok_count, (unsigned long)bs.crc_err_count,
                       (unsigned)g_abcdBus.getStoredFrameCount());
+    } else if (cmd.equalsIgnoreCase("wifi")) {
+        const NetworkConfig&        nc = g_netMgr.getConfig();
+        const NetworkRuntimeStatus  ns = g_netMgr.getStatus();
+        Serial.println("\n--- Wi-Fi, Fallback AP & OTA Status ---");
+        Serial.printf("  STA Configured   : SSID=\"%s\" | StaticIP=%s\n",
+                      nc.sta_ssid, nc.use_static_ip ? nc.static_ip : "DHCP");
+        Serial.printf("  STA Connected    : %s | IP=%s | RSSI=%ld dBm | Ch=%u | MAC=%s\n",
+                      ns.sta_connected ? "YES" : "NO",
+                      ns.sta_ip,
+                      (long)ns.sta_rssi_dbm, (unsigned)ns.sta_channel,
+                      ns.mac_addr);
+        Serial.printf("  mDNS / ArduinoOTA: http://%s.local/ | Port 3232 (%s)\n",
+                      nc.mdns_host, ns.ota_ready ? "READY" : "WAITING");
+        Serial.printf("  Rescue AP Mode   : %s | SSID=\"%s\" | IP=%s | Clients=%u\n\n",
+                      ns.ap_active ? "ACTIVE" : "OFF (Auto-Standby)",
+                      nc.ap_ssid,
+                      ns.ap_ip,
+                      (unsigned)ns.ap_clients);
+    } else if (cmd.equalsIgnoreCase("scan")) {
+        Serial.println("[CLI] Scanning 2.4 GHz Wi-Fi networks...");
+        Serial.println(g_netMgr.scanNetworksJson());
+    } else if (cmd.equalsIgnoreCase("ap on")) {
+        g_netMgr.setManualApOverride(true);
+    } else if (cmd.equalsIgnoreCase("ap off")) {
+        g_netMgr.setManualApOverride(false);
+    } else if (cmd.equalsIgnoreCase("reboot")) {
+        Serial.println("[CLI] Rebooting ESP32-S3...");
+        g_netMgr.scheduleReboot(200);
     } else if (cmd.startsWith("sim boiler ")) {
         const float t = cmd.substring(11).toFloat();
         g_waterSensor.setSimulatedTempsF(t, t - 15.0f);
@@ -189,8 +176,12 @@ void setup() {
     g_controller.begin();
 
     printHardwareBanner();
-    setupWiFi();
+    g_netMgr.begin();
     g_webPortal.begin();
+
+    Serial.println("  Serial CLI Ready : Type 'help' for interactive bench commands");
+    Serial.println("------------------------------------------------------------------------------");
+    Serial.println();
 
     g_lastHeartbeatMs = millis();
 }
@@ -199,15 +190,9 @@ void loop() {
     g_abcdBus.loop();
     g_waterSensor.loop();
     g_controller.loop();
+    g_netMgr.loop();
     g_webPortal.loop();
     pollSerialCli();
-
-    if (WiFi.isConnected() && !g_mdnsStarted) {
-        if (MDNS.begin(MDNS_HOSTNAME)) {
-            MDNS.addService("http", "tcp", 80);
-            g_mdnsStarted = true;
-        }
-    }
 
     const uint32_t now = millis();
 
@@ -226,8 +211,9 @@ void loop() {
         const WaterSensorStatus& ws = g_waterSensor.getStatus();
         const AbcdTelemetry&     bt = g_abcdBus.getTelemetry();
         const AbcdBusStats&      bs = g_abcdBus.getStats();
+        const NetworkRuntimeStatus ns = g_netMgr.getStatus();
 
-        Serial.printf("[#%04lu | %5lus] %-28s | Boiler: %5.1fF | Room: %4.1fF (IonSP:%2.0fF) | Fan: %-15s | Bus RX:%lu TX:%lu | IP: %s\n",
+        Serial.printf("[#%04lu | %5lus] %-28s | Boiler: %5.1fF | Room: %4.1fF (IonSP:%2.0fF) | Fan: %-15s | Bus RX:%lu TX:%lu | IP: %s%s\n",
                       (unsigned long)g_tick,
                       now / 1000UL,
                       g_controller.getStateName(),
@@ -237,7 +223,8 @@ void loop() {
                       AbcdBusDriver::fanModeToName(bt.ion_fan_mode),
                       (unsigned long)bs.total_rx_frames,
                       (unsigned long)bs.total_tx_frames,
-                      WiFi.isConnected() ? WiFi.localIP().toString().c_str() : "DISCONNECTED");
+                      ns.sta_connected ? ns.sta_ip : "DISCONNECTED",
+                      ns.ap_active ? " [AP:192.168.4.1]" : "");
 
         g_tick++;
     }
