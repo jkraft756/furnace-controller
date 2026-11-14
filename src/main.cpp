@@ -44,6 +44,40 @@ static void printHardwareBanner() {
     Serial.println("==============================================================================");
 }
 
+static bool parseHexByteToken(const String& tok, uint8_t& outByte) {
+    if (tok.length() == 0) {
+        return false;
+    }
+    char* endPtr = nullptr;
+    const unsigned long val = strtoul(tok.c_str(), &endPtr, 16);
+    if (endPtr == tok.c_str() || *endPtr != '\0' || val > 0xFFUL) {
+        return false;
+    }
+    outByte = static_cast<uint8_t>(val);
+    return true;
+}
+
+static size_t splitWhitespaceTokens(const String& s, String* outTokens, size_t maxTokens) {
+    size_t count = 0;
+    int idx = 0;
+    const int len = s.length();
+    while (idx < len && count < maxTokens) {
+        while (idx < len && isspace(static_cast<unsigned char>(s[idx]))) {
+            ++idx;
+        }
+        if (idx >= len) {
+            break;
+        }
+        int end = idx;
+        while (end < len && !isspace(static_cast<unsigned char>(s[end]))) {
+            ++end;
+        }
+        outTokens[count++] = s.substring(idx, end);
+        idx = end;
+    }
+    return count;
+}
+
 static void handleSerialCliLine(String cmd) {
     cmd.trim();
     if (cmd.length() == 0) {
@@ -58,8 +92,11 @@ static void handleSerialCliLine(String cmd) {
         Serial.println("  ap on / ap off      : Manually enable or disable the Setup Access Point (192.168.4.1)");
         Serial.println("  sim boiler <tempF>  : Set simulated Wood Boiler supply water temp (e.g. 'sim boiler 160')");
         Serial.println("  sim room <tempF>    : Set simulated Ion Room temp (e.g. 'sim room 68.0')");
-        Serial.println("  mode <0|1|2>        : Set mode (0=Passive Sniffer, 1=Auto Wood Co-Ctrl, 2=Manual Fan)");
+        Serial.println("  mode <0|1|2|3>      : Set mode (0=Passive Sniffer, 1=Auto Wood Co-Ctrl, 2=Manual Fan, 3=Prototyping Sim)");
         Serial.println("  packets             : Print the 10 most recent ABCD RS-485 bus frames");
+        Serial.println("  probe read <t0> <t1> <t2>            : Send FUNC_READ to Ion Thermostat (0x2001) as 0x9201");
+        Serial.println("  probe write <t0> <t1> <t2> <b0> [..] : Send FUNC_WRITE to Ion Thermostat (0x2001) as 0x9201");
+        Serial.println("  probe scan                           : Probe key Ion tables (00:3B:01..03, 00:04:03, 00:04:09)");
         Serial.println("  reboot              : Schedule a clean ESP32-S3 soft reboot");
         Serial.println("-------------------------------------\n");
     } else if (cmd.equalsIgnoreCase("status")) {
@@ -78,10 +115,10 @@ static void handleSerialCliLine(String cmd) {
                       AbcdBusDriver::stageToName(bt.furnace_stage),
                       AbcdBusDriver::fanModeToName(bt.ion_fan_mode),
                       (unsigned)bt.furnace_airflow_cfm, (unsigned)bt.blower_rpm);
-        Serial.printf("  ABCD Bus Stats   : RX=%lu TX=%lu CRC_OK=%lu CRC_ERR=%lu Stored=%u/250\n\n",
+        Serial.printf("  ABCD Bus Stats   : RX=%lu TX=%lu CRC_OK=%lu CRC_ERR=%lu Stored=%u/%u\n\n",
                       (unsigned long)bs.total_rx_frames, (unsigned long)bs.total_tx_frames,
                       (unsigned long)bs.crc_ok_count, (unsigned long)bs.crc_err_count,
-                      (unsigned)g_abcdBus.getStoredFrameCount());
+                      (unsigned)g_abcdBus.getStoredFrameCount(), (unsigned)ABCD_RING_BUFFER_CAP);
     } else if (cmd.equalsIgnoreCase("wifi")) {
         const NetworkConfig&        nc = g_netMgr.getConfig();
         const NetworkRuntimeStatus  ns = g_netMgr.getStatus();
@@ -123,7 +160,7 @@ static void handleSerialCliLine(String cmd) {
         Serial.printf("[CLI] Simulated Room Temp set to %.1f F -> State: %s\n", t, g_controller.getStateName());
     } else if (cmd.startsWith("mode ")) {
         const int m = cmd.substring(5).toInt();
-        if (m >= 0 && m <= 2) {
+        if (m >= 0 && m <= 3) {
             ControllerConfig cfg = g_controller.getConfig();
             cfg.op_mode = static_cast<OperatingMode>(m);
             g_controller.updateConfig(cfg, true);
@@ -148,6 +185,88 @@ static void handleSerialCliLine(String cmd) {
             }
         }
         Serial.println();
+    } else if (cmd.equalsIgnoreCase("probe scan")) {
+        static constexpr uint8_t kScanTables[5][3] = {
+            {0x00, 0x3B, 0x01},
+            {0x00, 0x3B, 0x02},
+            {0x00, 0x3B, 0x03},
+            {0x00, 0x04, 0x03},
+            {0x00, 0x04, 0x09},
+        };
+        Serial.printf("[CLI PROBE] Scanning 5 Ion Thermostat (0x%04X) tables from 0x%04X...\n",
+                      (unsigned)ADDR_THERMOSTAT, (unsigned)ADDR_CONTROLLER);
+        for (size_t i = 0; i < 5; ++i) {
+            const uint8_t t0 = kScanTables[i][0];
+            const uint8_t t1 = kScanTables[i][1];
+            const uint8_t t2 = kScanTables[i][2];
+            const bool sent = g_abcdBus.sendReadRequest(ADDR_THERMOSTAT, ADDR_CONTROLLER, t0, t1, t2);
+            Serial.printf("  [%u/5] READ %02X:%02X:%02X -> %s\n",
+                          (unsigned)(i + 1), (unsigned)t0, (unsigned)t1, (unsigned)t2,
+                          sent ? "RS485-TX" : "SIM-ONLY");
+            const uint32_t waitStart = millis();
+            while (millis() - waitStart < 60UL) {
+                g_abcdBus.loop();
+                delay(1);
+            }
+        }
+        Serial.println("[CLI PROBE] Scan complete. Run 'packets' to inspect responses.");
+    } else if (cmd.startsWith("probe read ")) {
+        String tokens[8];
+        const size_t n = splitWhitespaceTokens(cmd.substring(11), tokens, 8);
+        uint8_t t0 = 0, t1 = 0, t2 = 0;
+        if (n != 3 || !parseHexByteToken(tokens[0], t0) ||
+            !parseHexByteToken(tokens[1], t1) || !parseHexByteToken(tokens[2], t2)) {
+            Serial.println("[CLI PROBE] Usage: probe read <t0> <t1> <t2> (hex bytes, e.g. 'probe read 00 3B 01')");
+        } else {
+            const bool sent = g_abcdBus.sendReadRequest(ADDR_THERMOSTAT, ADDR_CONTROLLER, t0, t1, t2);
+            const uint32_t waitStart = millis();
+            while (millis() - waitStart < 60UL) {
+                g_abcdBus.loop();
+                delay(1);
+            }
+            Serial.printf("[CLI PROBE] READ 0x%04X->0x%04X %02X:%02X:%02X (%s)\n",
+                          (unsigned)ADDR_CONTROLLER, (unsigned)ADDR_THERMOSTAT,
+                          (unsigned)t0, (unsigned)t1, (unsigned)t2,
+                          sent ? "RS485-TX" : "SIM-ONLY");
+        }
+    } else if (cmd.startsWith("probe write ")) {
+        constexpr size_t kMaxTokens = 3 + (ABCD_MAX_FRAME_BYTES - 13);
+        String tokens[kMaxTokens];
+        const size_t n = splitWhitespaceTokens(cmd.substring(12), tokens, kMaxTokens);
+        uint8_t t0 = 0, t1 = 0, t2 = 0;
+        if (n < 4 || !parseHexByteToken(tokens[0], t0) ||
+            !parseHexByteToken(tokens[1], t1) || !parseHexByteToken(tokens[2], t2)) {
+            Serial.println("[CLI PROBE] Usage: probe write <t0> <t1> <t2> <b0> [b1 ...] (hex bytes)");
+        } else {
+            uint8_t payload[ABCD_MAX_FRAME_BYTES - 13];
+            size_t payloadLen = 0;
+            bool parseOk = true;
+            for (size_t i = 3; i < n; ++i) {
+                if (!parseHexByteToken(tokens[i], payload[payloadLen++])) {
+                    parseOk = false;
+                    break;
+                }
+            }
+            if (!parseOk) {
+                Serial.println("[CLI PROBE] Invalid hex byte in payload.");
+            } else {
+                const bool sent = g_abcdBus.sendWriteRequest(ADDR_THERMOSTAT, ADDR_CONTROLLER,
+                                                             t0, t1, t2, payload, payloadLen);
+                const uint32_t waitStart = millis();
+                while (millis() - waitStart < 60UL) {
+                    g_abcdBus.loop();
+                    delay(1);
+                }
+                if (!g_abcdBus.isTxEnabled()) {
+                    Serial.println("[CLI PROBE] Note: TX is disabled (Passive Sniffer mode); frame was simulated-only.");
+                } else {
+                    Serial.printf("[CLI PROBE] WRITE 0x%04X->0x%04X %02X:%02X:%02X (%u bytes) -> %s\n",
+                                  (unsigned)ADDR_CONTROLLER, (unsigned)ADDR_THERMOSTAT,
+                                  (unsigned)t0, (unsigned)t1, (unsigned)t2,
+                                  (unsigned)payloadLen, sent ? "RS485-TX" : "SIM-ONLY");
+                }
+            }
+        }
     } else {
         Serial.printf("[CLI] Unknown command '%s'. Type 'help'.\n", cmd.c_str());
     }

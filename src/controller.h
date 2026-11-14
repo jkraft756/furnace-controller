@@ -6,7 +6,8 @@
 enum class OperatingMode : uint8_t {
     PASSIVE_SNIFFER_ONLY     = 0,
     AUTO_WOOD_CO_CONTROLLER  = 1,
-    MANUAL_BLOWER_OVERRIDE   = 2
+    MANUAL_BLOWER_OVERRIDE   = 2,
+    PROTOTYPING_SIMULATION   = 3
 };
 
 enum class ControllerState : uint8_t {
@@ -23,7 +24,6 @@ struct ControllerConfig {
     float         boiler_on_f;
     float         boiler_off_f;
     float         comfort_setpoint_f;
-    float         gas_fallback_setpoint_f;
     AbcdFanMode   target_fan_speed;
 };
 

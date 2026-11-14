@@ -7,6 +7,7 @@
 #include <WebServer.h>
 #include <Update.h>
 #include <Preferences.h>
+#include <driver/gpio.h>
 
 static WebServer s_server(80);
 static bool      s_otaSuccess = false;
@@ -326,7 +327,7 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(<!DOCTYPE html>
       <div class="card">
         <div class="label">Heil G96CTN Heating Stage</div>
         <div class="value" id="furnaceStage" style="font-size:1.05rem;">--</div>
-        <div class="subvalue" id="supplyAirInfo">Supply Air: -- °F</div>
+        <div class="subvalue" id="supplyAirInfo">Relay: IDLE (0x06) &bull; Static: 0.00 in.wc</div>
       </div>
       <div class="card">
         <div class="label">Network &amp; AP Status</div>
@@ -344,10 +345,11 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(<!DOCTYPE html>
         </h2>
         <div class="form-row">
           <label for="cfgOpMode">Operating Mode</label>
-          <select id="cfgOpMode">
+          <select id="cfgOpMode" onchange="updateSimPanelVisibility()">
             <option value="0">0 - Passive Bus Sniffer Only (DE/RE LOW)</option>
             <option value="1">1 - Auto Wood Boiler Co-Controller</option>
             <option value="2">2 - Manual ECM Blower Override</option>
+            <option value="3">3 - Prototyping Simulation</option>
           </select>
         </div>
         <div class="form-row">
@@ -363,25 +365,20 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(<!DOCTYPE html>
           <input type="number" step="0.5" min="55" max="85" id="cfgComfortSp" value="70.0">
         </div>
         <div class="form-row">
-          <label for="cfgFallbackSp">Ion Gas Backup Setpoint When Wood Hot (°F)</label>
-          <input type="number" step="1" min="50" max="75" id="cfgFallbackSp" value="64">
-        </div>
-        <div class="form-row">
           <label for="cfgFanSpeed">Hydronic Heating ECM Blower Speed</label>
           <select id="cfgFanSpeed">
-            <option value="1">LOW (650 CFM / Quiet Circulation)</option>
-            <option value="2">MED (1,050 CFM / Balanced Hydronic Heat)</option>
-            <option value="3">HIGH (1,400 CFM / Max BTU Output)</option>
+            <option value="1">LOW (413 CFM / 563 RPM / ~54W)</option>
+            <option value="2">MED (667 CFM / 635 RPM / ~197W)</option>
+            <option value="3">HIGH (1,050 CFM / 767 RPM / ~565W)</option>
           </select>
         </div>
         <div class="btn-row">
           <button class="primary" onclick="saveConfig()">Save &amp; Apply Settings</button>
-          <button onclick="toggleSimPanel()" id="btnToggleSim">Hide Bench Simulator</button>
         </div>
       </div>
 
-      <!-- Interactive Bench Simulation Panel -->
-      <div class="panel" id="simPanel">
+      <!-- Interactive Bench Simulation Panel (visible only in Prototyping Simulation mode) -->
+      <div class="panel" id="simPanel" style="display:none;">
         <h2>
           <span>Desk Prototyping &amp; Sensor Simulator</span>
           <span id="probeBadge" style="font-size:0.75rem;color:var(--muted);">Probes: 0</span>
@@ -432,7 +429,7 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(<!DOCTYPE html>
           <option value="write">Filter: WRITE Commands (0x0C)</option>
           <option value="tx">Filter: ESP32 Co-Controller TX</option>
           <option value="tstat">Filter: Ion Thermostat (0x2001)</option>
-          <option value="furnace">Filter: Heil G96CTN (0x4001)</option>
+          <option value="furnace">Filter: Heil G96CTN (0x4401)</option>
         </select>
         <button onclick="injectBusCycle()" class="primary">Inject Simulated Bus Cycle</button>
         <button onclick="togglePauseCapture()" id="btnPause">Pause Capture</button>
@@ -459,6 +456,30 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(<!DOCTYPE html>
             <tr><td colspan="9" style="color:var(--muted);">Loading packets from 8MB Octal PSRAM buffer...</td></tr>
           </tbody>
         </table>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h2>
+        <span>Thermostat Probe (0x2001)</span>
+        <span id="probeResult" style="font-size:0.78rem;color:var(--muted);">Ready (Src: 0x9201)</span>
+      </h2>
+      <div class="btn-row" style="margin-top:0;margin-bottom:8px;">
+        <button onclick="probeBus('read', '00:3B:01', '')" class="primary">Read 00:3B:01</button>
+        <button onclick="probeBus('read', '00:04:09', '')" class="primary">Read 00:04:09</button>
+      </div>
+      <div style="display:flex;flex-wrap:wrap;gap:8px;align-items:center;">
+        <label style="font-size:0.76rem;color:var(--muted);">Dest:
+          <input type="text" id="probeDest" value="2001" style="width:68px;margin-left:4px;" placeholder="2001">
+        </label>
+        <label style="font-size:0.76rem;color:var(--muted);">Table:
+          <input type="text" id="probeTable" value="00:3B:01" style="width:92px;margin-left:4px;" placeholder="00:3B:01">
+        </label>
+        <label style="font-size:0.76rem;color:var(--muted);flex:1;min-width:180px;">Payload (hex):
+          <input type="text" id="probePayload" value="" style="width:180px;margin-left:4px;" placeholder="e.g. 00 00 02 9B">
+        </label>
+        <button onclick="probeBus('read')">Send Read</button>
+        <button onclick="probeBus('write')">Send Write</button>
       </div>
     </div>
   </div>
@@ -624,10 +645,9 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(<!DOCTYPE html>
       if (tab === 'network' && !g_netInitialized) loadNetConfig();
     }
 
-    function toggleSimPanel() {
-      g_simVisible = !g_simVisible;
-      document.getElementById('simPanel').style.display = g_simVisible ? 'block' : 'none';
-      document.getElementById('btnToggleSim').textContent = g_simVisible ? 'Hide Bench Simulator' : 'Show Bench Simulator';
+    function updateSimPanelVisibility() {
+      const isSim = document.getElementById('cfgOpMode').value === '3';
+      document.getElementById('simPanel').style.display = isSim ? 'block' : 'none';
     }
 
     function toggleStaticFields() {
@@ -679,10 +699,14 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(<!DOCTYPE html>
         }
 
         document.getElementById('fanMode').textContent = d.fan_mode;
-        document.getElementById('cfmRpm').textContent = d.airflow_cfm + ' CFM • ' + d.blower_rpm + ' RPM';
+        document.getElementById('cfmRpm').textContent =
+          d.airflow_cfm + ' CFM • ' + d.blower_rpm + ' RPM' +
+          (d.blower_watts !== undefined ? (' • ' + d.blower_watts.toFixed(0) + ' W') : '');
 
         document.getElementById('furnaceStage').textContent = d.furnace_stage;
-        document.getElementById('supplyAirInfo').textContent = 'Plenum Supply Air: ' + d.supply_air_f.toFixed(0) + ' °F';
+        document.getElementById('supplyAirInfo').textContent =
+          'Relay: ' + (d.relay_status || 'IDLE') + ' • Static: ' +
+          (d.static_press_inwc !== undefined ? d.static_press_inwc.toFixed(2) : '0.00') + ' in.wc';
 
         document.getElementById('wifiInfo').textContent = d.ip + ' (' + d.rssi_dbm + ' dBm)';
         document.getElementById('apSummary').textContent =
@@ -721,8 +745,8 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(<!DOCTYPE html>
           document.getElementById('cfgBoilerOn').value = d.cfg.boiler_on;
           document.getElementById('cfgBoilerOff').value = d.cfg.boiler_off;
           document.getElementById('cfgComfortSp').value = d.cfg.comfort_sp;
-          document.getElementById('cfgFallbackSp').value = d.cfg.fallback_sp;
           document.getElementById('cfgFanSpeed').value = d.cfg.fan_speed;
+          updateSimPanelVisibility();
           g_cfgInitialized = true;
         }
         if (!g_simInitialized) {
@@ -887,7 +911,6 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(<!DOCTYPE html>
         boiler_on: document.getElementById('cfgBoilerOn').value,
         boiler_off: document.getElementById('cfgBoilerOff').value,
         comfort_sp: document.getElementById('cfgComfortSp').value,
-        fallback_sp: document.getElementById('cfgFallbackSp').value,
         fan_speed: document.getElementById('cfgFanSpeed').value
       });
       await fetch('/api/config?' + params.toString(), { method: 'POST' });
@@ -943,6 +966,30 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(<!DOCTYPE html>
       refreshStatus();
     }
 
+    async function probeBus(action, tableOverride, payloadOverride) {
+      const dest = (document.getElementById('probeDest').value || '2001').trim();
+      const table = (tableOverride !== undefined ? tableOverride : document.getElementById('probeTable').value).trim();
+      const payload = (payloadOverride !== undefined ? payloadOverride : document.getElementById('probePayload').value).trim();
+      const badge = document.getElementById('probeResult');
+      badge.textContent = 'Sending ' + action.toUpperCase() + ' ' + table + '...';
+      try {
+        const params = new URLSearchParams({ action, table, dest });
+        if (payload.length > 0) params.set('payload', payload);
+        const res = await fetch('/api/bus/probe?' + params.toString(), { method: 'POST' });
+        const data = await res.json();
+        if (!res.ok || !data.ok) {
+          badge.textContent = 'Error: ' + (data.error || ('HTTP ' + res.status));
+        } else {
+          const txNote = data.sent ? 'RS485-TX' : (data.simulated ? 'SIM-ONLY (TX disabled)' : 'SIM-TX');
+          badge.textContent = action.toUpperCase() + ' ' + data.table + ' -> ' + data.dest + ' [' + txNote + ']';
+        }
+      } catch (e) {
+        badge.textContent = 'Probe request failed';
+      }
+      refreshPackets();
+      refreshStatus();
+    }
+
     async function refreshPackets() {
       try {
         const res = await fetch('/api/packets?limit=60');
@@ -951,13 +998,13 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(<!DOCTYPE html>
         const tbody = document.getElementById('pktTableBody');
 
         document.getElementById('snifferStats').textContent =
-          'Stored in PSRAM: ' + data.stored + '/250 frames • CRC OK: ' + data.crc_ok + ' • CRC Errors: ' + data.crc_err;
+          'Stored in Buffer: ' + data.stored + ' frames • CRC OK: ' + data.crc_ok + ' • CRC Errors: ' + data.crc_err;
 
         const filtered = data.packets.filter(p => {
           if (filter === 'write') return p.func === 'WRITE';
           if (filter === 'tx') return p.is_tx;
           if (filter === 'tstat') return p.src.includes('2001') || p.dest.includes('2001');
-          if (filter === 'furnace') return p.src.includes('4001') || p.dest.includes('4001');
+          if (filter === 'furnace') return p.src.includes('4001') || p.dest.includes('4001') || p.src.includes('4401') || p.dest.includes('4401');
           return true;
         });
 
@@ -1044,13 +1091,15 @@ static void handleApiStatus() {
              "\"furnace_stage\":\"%s\","
              "\"airflow_cfm\":%u,"
              "\"blower_rpm\":%u,"
+             "\"blower_watts\":%.1f,"
+             "\"static_press_inwc\":%.2f,"
+             "\"relay_status\":\"%s\","
              "\"supply_air_f\":%.1f,"
              "\"cfg\":{"
                "\"op_mode\":%u,"
                "\"boiler_on\":%.1f,"
                "\"boiler_off\":%.1f,"
                "\"comfort_sp\":%.1f,"
-               "\"fallback_sp\":%.1f,"
                "\"fan_speed\":%u"
              "},"
              "\"bus\":{"
@@ -1060,6 +1109,8 @@ static void handleApiStatus() {
                "\"crc_err\":%lu,"
                "\"stored\":%u,"
                "\"idle_ms\":%lu,"
+               "\"rx_pin\":%d,"
+               "\"rx_bytes\":%lu,"
                "\"tx_enabled\":%s,"
                "\"sim_bus\":%s,"
                "\"paused\":%s,"
@@ -1098,12 +1149,14 @@ static void handleApiStatus() {
              AbcdBusDriver::stageToName(bt.furnace_stage),
              (unsigned)bt.furnace_airflow_cfm,
              (unsigned)bt.blower_rpm,
+             bt.blower_watts,
+             bt.static_press_hundredths / 100.0f,
+             bt.relay_status[0] ? bt.relay_status : "IDLE (0x06)",
              bt.supply_air_temp_f,
              (unsigned)cc.op_mode,
              cc.boiler_on_f,
              cc.boiler_off_f,
              cc.comfort_setpoint_f,
-             cc.gas_fallback_setpoint_f,
              (unsigned)cc.target_fan_speed,
              (unsigned long)bs.total_rx_frames,
              (unsigned long)bs.total_tx_frames,
@@ -1111,6 +1164,8 @@ static void handleApiStatus() {
              (unsigned long)bs.crc_err_count,
              (unsigned)g_abcdBus.getStoredFrameCount(),
              (unsigned long)g_abcdBus.getBusIdleMs(),
+             (int)bs.active_rx_pin,
+             (unsigned long)bs.physical_rx_bytes,
              bs.tx_enabled ? "true" : "false",
              bs.sim_bus_enabled ? "true" : "false",
              bs.capture_paused ? "true" : "false",
@@ -1131,7 +1186,7 @@ static void handleApiConfig() {
 
     if (s_server.hasArg("op_mode")) {
         const int m = s_server.arg("op_mode").toInt();
-        if (m >= 0 && m <= 2) cfg.op_mode = static_cast<OperatingMode>(m);
+        if (m >= 0 && m <= 3) cfg.op_mode = static_cast<OperatingMode>(m);
     }
     if (s_server.hasArg("boiler_on")) {
         cfg.boiler_on_f = s_server.arg("boiler_on").toFloat();
@@ -1141,9 +1196,6 @@ static void handleApiConfig() {
     }
     if (s_server.hasArg("comfort_sp")) {
         cfg.comfort_setpoint_f = s_server.arg("comfort_sp").toFloat();
-    }
-    if (s_server.hasArg("fallback_sp")) {
-        cfg.gas_fallback_setpoint_f = s_server.arg("fallback_sp").toFloat();
     }
     if (s_server.hasArg("fan_speed")) {
         const int f = s_server.arg("fan_speed").toInt();
@@ -1170,6 +1222,12 @@ static void handleApiSim() {
     }
     if (s_server.hasArg("sim_bus")) {
         g_abcdBus.setSimBusEnabled(s_server.arg("sim_bus").toInt() != 0);
+    }
+    if (s_server.hasArg("rx_pin")) {
+        const int rxp = s_server.arg("rx_pin").toInt();
+        if (rxp == 17 || rxp == 18) {
+            g_abcdBus.setUartPins(static_cast<int8_t>(rxp), static_cast<int8_t>(rxp == 17 ? 18 : 17));
+        }
     }
     if (s_server.hasArg("inject_cycle")) {
         g_abcdBus.injectSimulatedCycle();
@@ -1352,7 +1410,7 @@ static void handleApiPackets() {
 
     AbcdFrameRecord rec{};
     char hexBuf[3 * ABCD_MAX_FRAME_BYTES + 4];
-    char rowBuf[512];
+    char rowBuf[3 * ABCD_MAX_FRAME_BYTES + 320];
 
     for (size_t i = 0; i < countToSend; ++i) {
         if (!g_abcdBus.getFrameByOffsetFromNewest(i, rec)) {
@@ -1393,7 +1451,7 @@ static void handleApiPacketsCsv() {
 
     AbcdFrameRecord rec{};
     char hexBuf[3 * ABCD_MAX_FRAME_BYTES + 4];
-    char lineBuf[512];
+    char lineBuf[3 * ABCD_MAX_FRAME_BYTES + 320];
 
     for (size_t i = 0; i < totalStored; ++i) {
         const size_t offsetFromNewest = totalStored - 1 - i;
@@ -1422,6 +1480,219 @@ static void handleApiPacketsCsv() {
     s_server.send(200, "text/csv", csv);
 }
 
+static void handleApiPinscan() {
+    static constexpr uint8_t kPins[] = {
+        1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14,
+        15, 16, 17, 18, 19, 20, 21, 38, 39, 40, 41, 42, 47, 48
+    };
+    static constexpr size_t kNumPins = sizeof(kPins) / sizeof(kPins[0]);
+
+    const int8_t savedRx = g_abcdBus.getStats().active_rx_pin;
+    const int8_t savedTx = g_abcdBus.getStats().active_tx_pin;
+    const bool   pullup  = !s_server.hasArg("pullup") || (s_server.arg("pullup").toInt() != 0);
+
+    // Temporarily release UART1 so neither GPIO 17 nor GPIO 18 is driven push-pull by UART1_TX during the scan
+    Serial1.end();
+
+    if (s_server.hasArg("dere")) {
+        digitalWrite(ABCD_UART_DERE_PIN, s_server.arg("dere").toInt() != 0 ? HIGH : LOW);
+    }
+
+    uint8_t  initLevel[kNumPins];
+    uint8_t  lastLevel[kNumPins];
+    uint32_t edges[kNumPins];
+
+    for (size_t i = 0; i < kNumPins; ++i) {
+        const gpio_num_t pin = static_cast<gpio_num_t>(kPins[i]);
+        // Enable input buffer on every scanned pin so gpio_get_level reads the physical pad state
+        gpio_input_enable(pin);
+        if (kPins[i] != 4 && kPins[i] != 21 && kPins[i] != 48 && kPins[i] != 19 && kPins[i] != 20) {
+            gpio_set_direction(pin, GPIO_MODE_INPUT);
+            if (pullup) {
+                gpio_pullup_en(pin);
+                gpio_pulldown_dis(pin);
+            } else {
+                gpio_pullup_dis(pin);
+                gpio_pulldown_dis(pin);
+            }
+        }
+    }
+    delayMicroseconds(200);
+
+    for (size_t i = 0; i < kNumPins; ++i) {
+        const uint8_t lvl = static_cast<uint8_t>(gpio_get_level(static_cast<gpio_num_t>(kPins[i])));
+        initLevel[i] = lvl;
+        lastLevel[i] = lvl;
+        edges[i]     = 0;
+    }
+
+    const uint32_t startMs = millis();
+    uint32_t samples = 0;
+    while (millis() - startMs < 1000UL) {
+        for (size_t i = 0; i < kNumPins; ++i) {
+            const uint8_t lvl = static_cast<uint8_t>(gpio_get_level(static_cast<gpio_num_t>(kPins[i])));
+            if (lvl != lastLevel[i]) {
+                edges[i]++;
+                lastLevel[i] = lvl;
+            }
+        }
+        samples++;
+        delayMicroseconds(20);
+    }
+
+    // Restore DE/RE LOW (if in passive mode) and restore UART1 pins
+    if (!g_abcdBus.isTxEnabled()) {
+        digitalWrite(ABCD_UART_DERE_PIN, LOW);
+    }
+    g_abcdBus.setUartPins(savedRx, savedTx);
+
+    String out;
+    out.reserve(2048);
+    out += "{\"samples\":";
+    out += String(samples);
+    out += ",\"pullup\":";
+    out += (pullup ? "true" : "false");
+    out += ",\"pins\":[";
+    for (size_t i = 0; i < kNumPins; ++i) {
+        if (i > 0) out += ",";
+        char buf[96];
+        snprintf(buf, sizeof(buf), "{\"gpio\":%u,\"level\":%u,\"last\":%u,\"edges\":%lu}",
+                 (unsigned)kPins[i], (unsigned)initLevel[i], (unsigned)lastLevel[i], (unsigned long)edges[i]);
+        out += buf;
+    }
+    out += "]}";
+    s_server.send(200, "application/json", out);
+}
+
+static void handleApiProbe() {
+    uint16_t destAddr = 0x2001;
+    uint16_t srcAddr  = 0x4401;
+    uint8_t  t0 = 0x00, t1 = 0x01, t2 = 0x04;
+
+    if (s_server.hasArg("dest")) {
+        destAddr = static_cast<uint16_t>(strtoul(s_server.arg("dest").c_str(), nullptr, 16));
+    }
+    if (s_server.hasArg("src")) {
+        srcAddr = static_cast<uint16_t>(strtoul(s_server.arg("src").c_str(), nullptr, 16));
+    }
+    if (s_server.hasArg("table")) {
+        unsigned int a = 0, b = 0, c = 0;
+        if (sscanf(s_server.arg("table").c_str(), "%x:%x:%x", &a, &b, &c) == 3) {
+            t0 = static_cast<uint8_t>(a);
+            t1 = static_cast<uint8_t>(b);
+            t2 = static_cast<uint8_t>(c);
+        }
+    }
+
+    const bool sent = g_abcdBus.sendReadRequest(destAddr, srcAddr, t0, t1, t2);
+    // Pump incoming bytes for 60 ms to capture immediate reply from target node
+    const uint32_t waitStart = millis();
+    while (millis() - waitStart < 60UL) {
+        g_abcdBus.loop();
+        delay(1);
+    }
+
+    char buf[160];
+    snprintf(buf, sizeof(buf),
+             "{\"ok\":%s,\"dest\":\"0x%04X\",\"src\":\"0x%04X\",\"table\":\"%02X:%02X:%02X\"}",
+             sent ? "true" : "false",
+             (unsigned)destAddr, (unsigned)srcAddr,
+             (unsigned)t0, (unsigned)t1, (unsigned)t2);
+    s_server.send(200, "application/json", buf);
+}
+
+static void handleApiBusProbe() {
+    String action = s_server.hasArg("action") ? s_server.arg("action") : "read";
+    action.trim();
+    action.toLowerCase();
+    if (action != "read" && action != "write") {
+        s_server.send(400, "application/json", "{\"ok\":false,\"error\":\"Invalid action (expected read or write)\"}");
+        return;
+    }
+
+    uint16_t destAddr = ADDR_THERMOSTAT;
+    if (s_server.hasArg("dest") && s_server.arg("dest").length() > 0) {
+        char* endPtr = nullptr;
+        const unsigned long parsedDest = strtoul(s_server.arg("dest").c_str(), &endPtr, 16);
+        if (endPtr == s_server.arg("dest").c_str() || parsedDest > 0xFFFFUL) {
+            s_server.send(400, "application/json", "{\"ok\":false,\"error\":\"Invalid dest hex address\"}");
+            return;
+        }
+        destAddr = static_cast<uint16_t>(parsedDest);
+    }
+
+    uint8_t t0 = 0, t1 = 0, t2 = 0;
+    unsigned int a = 0, b = 0, c = 0;
+    if (!s_server.hasArg("table") || sscanf(s_server.arg("table").c_str(), "%x:%x:%x", &a, &b, &c) != 3 ||
+        a > 0xFFU || b > 0xFFU || c > 0xFFU) {
+        s_server.send(400, "application/json", "{\"ok\":false,\"error\":\"Invalid table (expected XX:XX:XX)\"}");
+        return;
+    }
+    t0 = static_cast<uint8_t>(a);
+    t1 = static_cast<uint8_t>(b);
+    t2 = static_cast<uint8_t>(c);
+
+    uint8_t payload[ABCD_MAX_FRAME_BYTES - 13];
+    size_t payloadLen = 0;
+    if (s_server.hasArg("payload")) {
+        const String rawPayload = s_server.arg("payload");
+        int idx = 0;
+        const int len = rawPayload.length();
+        while (idx < len) {
+            while (idx < len && (rawPayload[idx] == ' ' || rawPayload[idx] == ',' || rawPayload[idx] == '\t')) {
+                ++idx;
+            }
+            if (idx >= len) break;
+            int end = idx;
+            while (end < len && rawPayload[end] != ' ' && rawPayload[end] != ',' && rawPayload[end] != '\t') {
+                ++end;
+            }
+            const String tok = rawPayload.substring(idx, end);
+            char* endPtr = nullptr;
+            const unsigned long val = strtoul(tok.c_str(), &endPtr, 16);
+            if (endPtr == tok.c_str() || *endPtr != '\0' || val > 0xFFUL) {
+                s_server.send(400, "application/json", "{\"ok\":false,\"error\":\"Invalid hex byte in payload\"}");
+                return;
+            }
+            if (payloadLen >= sizeof(payload)) {
+                s_server.send(400, "application/json", "{\"ok\":false,\"error\":\"Payload exceeds max ABCD frame size\"}");
+                return;
+            }
+            payload[payloadLen++] = static_cast<uint8_t>(val);
+            idx = end;
+        }
+    }
+
+    bool sent = false;
+    bool simulated = false;
+    if (action == "write") {
+        sent = g_abcdBus.sendWriteRequest(destAddr, ADDR_CONTROLLER, t0, t1, t2, payload, payloadLen);
+        simulated = !sent;
+    } else {
+        sent = g_abcdBus.sendReadRequest(destAddr, ADDR_CONTROLLER, t0, t1, t2);
+        simulated = !sent;
+    }
+
+    const uint32_t waitStart = millis();
+    while (millis() - waitStart < 60UL) {
+        g_abcdBus.loop();
+        delay(1);
+    }
+
+    char buf[224];
+    snprintf(buf, sizeof(buf),
+             "{\"ok\":true,\"action\":\"%s\",\"sent\":%s,\"tx_enabled\":%s,\"simulated\":%s,"
+             "\"dest\":\"0x%04X\",\"src\":\"0x%04X\",\"table\":\"%02X:%02X:%02X\",\"payload_len\":%u}",
+             action.c_str(),
+             sent ? "true" : "false",
+             g_abcdBus.isTxEnabled() ? "true" : "false",
+             simulated ? "true" : "false",
+             (unsigned)destAddr, (unsigned)ADDR_CONTROLLER,
+             (unsigned)t0, (unsigned)t1, (unsigned)t2,
+             (unsigned)payloadLen);
+    s_server.send(200, "application/json", buf);
+}
+
 void WebPortal::begin() {
     s_server.on("/", HTTP_GET, handleRoot);
     s_server.on("/api/status", HTTP_GET, handleApiStatus);
@@ -1429,6 +1700,9 @@ void WebPortal::begin() {
     s_server.on("/api/sim", HTTP_ANY, handleApiSim);
     s_server.on("/api/packets", HTTP_GET, handleApiPackets);
     s_server.on("/api/packets.csv", HTTP_GET, handleApiPacketsCsv);
+    s_server.on("/api/pinscan", HTTP_GET, handleApiPinscan);
+    s_server.on("/api/probe", HTTP_ANY, handleApiProbe);
+    s_server.on("/api/bus/probe", HTTP_POST, handleApiBusProbe);
 
     // Wireless Provisioning, AP & OTA Endpoints
     s_server.on("/api/wifi/scan", HTTP_GET, handleApiWifiScan);
